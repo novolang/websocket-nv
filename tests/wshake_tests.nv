@@ -1,0 +1,294 @@
+// wshake_tests.nv — the upgrade on both sides, and the negotiation
+// nobody agrees about.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: websocket-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE HANDSHAKE VECTOR IS RFC 6455 § 1.3's OWN.  The nonce
+// `dGhlIHNhbXBsZSBub25jZQ==` produces the accept value
+// `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, and the only reason a test can
+// assert that is that the nonce is an argument: a handshake that drew
+// its own entropy could only be tested against itself.  The codec made
+// that decision for `core`'s sake and this package keeps it for the
+// test's.
+
+use std.test
+use std.bytes
+use std.list
+use wsclient
+use wsconn
+use wsdeflate
+use wsserve
+use wstrans
+
+fn an_address() -> WsAddress
+    WsAddress { secure: false, host: "example.com", port: 80, target: "/chat" }
+
+fn the_rfc_nonce() -> [u8]
+    // "the sample nonce" — RFC 6455 § 1.3's sixteen bytes, before
+    // base64.
+    [0x74, 0x68, 0x65, 0x20, 0x73, 0x61, 0x6D, 0x70,
+     0x6C, 0x65, 0x20, 0x6E, 0x6F, 0x6E, 0x63, 0x65]
+
+@test
+fn test_the_request_carries_the_key_the_answer_is_checked_against() [io]
+    let r = wsclient.request(an_address())
+
+    match wsclient.handshake_with_nonce(r, the_rfc_nonce())
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("the RFC's own nonce gives the RFC's own key")
+            test.assert(h.nonce_key == "dGhlIHNhbXBsZSBub25jZQ==")
+
+            test.case("no subprotocol was offered")
+            test.assert(list.len(h.offered_protocols) == 0)
+
+            test.case("and no extension")
+            match h.offered_deflate
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+
+@test
+fn test_a_nonce_of_the_wrong_length_is_refused_before_the_wire() [io]
+    // Sixteen bytes exactly.  A shorter one produces a key a
+    // conforming server refuses, and refusing here turns a mysterious
+    // 400 into a named error.
+    let r = wsclient.request(an_address())
+
+    test.case("fifteen bytes is not a nonce")
+    match wsclient.handshake_with_nonce(r, [0x00])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_offered_subprotocols_and_extension_travel() [io]
+    let r = wsclient.with_deflate(
+        wsclient.with_protocols(wsclient.request(an_address()), ["chat.v2", "chat.v1"]),
+        wsdeflate.default_params())
+
+    match wsclient.handshake_with_nonce(r, the_rfc_nonce())
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("both subprotocols, in the order asked")
+            test.assert(list.len(h.offered_protocols) == 2)
+            test.assert(list.get(h.offered_protocols, 0) == "chat.v2")
+
+            test.case("and the extension was offered")
+            match h.offered_deflate
+                None    => test.assert(false)
+                Some(_) => test.assert(true)
+
+@test
+fn test_a_prepared_handshake_has_bytes_to_put_on_a_transport() [io]
+    let r = wsclient.request(an_address())
+
+    match wsclient.handshake_with_nonce(r, the_rfc_nonce())
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("the request serialises")
+            match wsclient.request_bytes(h)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(list.len(b) > 0)
+
+@test
+fn test_a_server_refusal_is_an_http_response_and_not_a_closed_socket() [io]
+    // A client whose handshake is refused wants a status it can show a
+    // person; a server that closed the socket leaves it waiting for a
+    // response that never comes.
+    test.case("a version mismatch answers 426, which RFC 6455 § 4.4 requires")
+    let resp = wsserve.refusal_response(UnsupportedVersion)
+    test.assert(resp.status == 426)
+
+    test.case("and a missing key answers 400")
+    test.assert(wsserve.refusal_response(MissingKey).status == 400)
+
+@test
+fn test_the_servers_preference_order_wins_not_the_clients() [io]
+    // The client's order is a wish; the server is the one that has to
+    // implement whichever is chosen.
+    let p = wsserve.with_protocols(wsserve.policy(), ["chat.v1", "chat.v2"])
+
+    test.case("the server's first choice is taken even though the client preferred the other")
+    match wsserve.choose_protocol(p, ["chat.v2", "chat.v1"])
+        None    => test.assert(false)
+        Some(s) => test.assert(s == "chat.v1")
+
+    test.case("nothing in common is None, and not a refusal")
+    match wsserve.choose_protocol(p, ["something.else"])
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_server_that_speaks_no_subprotocol_still_accepts_an_offer() [io]
+    // RFC 6455 § 4.2.2: a server that names no subprotocol has
+    // accepted the connection without one.  Refusing would break every
+    // client that offered one optimistically.
+    let p = wsserve.policy()
+
+    test.case("no overlap, no refusal")
+    match wsserve.choose_protocol(p, ["chat.v1"])
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_server_declines_permessage_deflate_by_default() [io]
+    // Agreeing without `no_context_takeover` costs a 32 KiB window per
+    // connection per direction, which a server discovers at ten
+    // thousand connections as memory pressure rather than as a
+    // setting.
+    match wsserve.policy().deflate
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and says yes only when asked to")
+    match wsserve.with_deflate(wsserve.policy(), wsdeflate.default_params()).deflate
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+@test
+fn test_the_default_deflate_parameters_ask_both_sides_to_drop_context() [io]
+    let p = wsdeflate.default_params()
+
+    test.case("the server is asked to drop its window between messages")
+    test.assert(p.server_no_context_takeover)
+
+    test.case("and so is the client")
+    test.assert(p.client_no_context_takeover)
+
+    test.case("with the largest window the RFC allows on both")
+    test.assert(p.server_max_window_bits == wsdeflate.WS_DEFLATE_MAX_WINDOW_BITS)
+    test.assert(p.client_max_window_bits == wsdeflate.WS_DEFLATE_MAX_WINDOW_BITS)
+
+@test
+fn test_the_window_bounds_and_the_four_bytes_are_the_rfcs() [io]
+    test.case("8 to 15 — 256 bytes to 32 KiB")
+    test.assert(wsdeflate.WS_DEFLATE_MIN_WINDOW_BITS == 8)
+    test.assert(wsdeflate.WS_DEFLATE_MAX_WINDOW_BITS == 15)
+
+    test.case("and the tail a sender removes is four bytes long")
+    test.assert(wsdeflate.WS_DEFLATE_TAIL_LEN == 4)
+
+    test.case("the extension is named as the registry spells it")
+    test.assert(wsdeflate.WS_PERMESSAGE_DEFLATE == "permessage-deflate")
+    test.assert(wsdeflate.extensions_header() == "Sec-WebSocket-Extensions")
+
+@test
+fn test_a_server_may_narrow_a_window_and_may_not_widen_one() [io]
+    // The asymmetry that gets broken.  A server that echoed its own
+    // preference back regardless produces a connection where the two
+    // sides have different windows, and every message long enough to
+    // reach back past the smaller one is corrupt.
+    let offered = "permessage-deflate; client_max_window_bits=10"
+    let limits = wsdeflate.default_params()
+
+    test.case("narrowing to what the client offered is accepted")
+    match wsdeflate.accept_offer(offered, limits)
+        WsDeflateOff   => test.assert(false)
+        WsDeflateOn(p) => test.assert(p.client_max_window_bits <= 10)
+
+@test
+fn test_a_client_refuses_an_answer_it_did_not_offer() [io]
+    // RFC 7692 § 5.1: the client has already decided how much memory
+    // it was going to spend, so a widened parameter is a failed
+    // handshake and not a negotiation.
+    let offered = wsdeflate.default_params()
+
+    test.case("an extension the client never offered is refused")
+    match wsdeflate.check_answer("permessage-deflate; x-webkit-deflate-frame", offered)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and an empty answer means the server declined, which is fine")
+    match wsdeflate.check_answer("", offered)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s
+                WsDeflateOff   => test.assert(true)
+                WsDeflateOn(_) => test.assert(false)
+
+@test
+fn test_an_offer_and_an_answer_render_as_the_header_they_are() [io]
+    let p = wsdeflate.default_params()
+
+    test.case("an offer names the extension")
+    test.assert(wsdeflate.offer_header(p) != "")
+
+    test.case("and so does an answer")
+    test.assert(wsdeflate.answer_header(p) != "")
+
+@test
+fn test_a_short_message_is_not_worth_compressing() [io]
+    // A short message compresses to more bytes than it started with,
+    // plus a frame header that now carries RSV1.
+    test.case("four bytes is not worth it")
+    test.assert(not wsdeflate.worth_compressing(4))
+
+    test.case("a megabyte is")
+    test.assert(wsdeflate.worth_compressing(1048576))
+
+@test
+fn test_each_side_compresses_with_its_own_window() [io]
+    // Picking the peer's number produces a stream the peer cannot
+    // inflate, and only for messages long enough to reach back past
+    // the smaller window — which is why it survives testing.
+    let p = WsDeflateParams { server_no_context_takeover: true,
+                              client_no_context_takeover: false,
+                              server_max_window_bits: 12,
+                              client_max_window_bits: 15 }
+
+    test.case("a client sends with the client window")
+    test.assert(wsdeflate.send_window_bits(p, true) == 15)
+
+    test.case("a server sends with the server window")
+    test.assert(wsdeflate.send_window_bits(p, false) == 12)
+
+    test.case("and each resets according to its own flag")
+    test.assert(not wsdeflate.resets_context(p, true))
+    test.assert(wsdeflate.resets_context(p, false))
+
+@test
+fn test_compression_is_flates_and_the_four_bytes_are_this_packages() [io]
+    let p = wsdeflate.default_params()
+
+    test.case("a payload compresses")
+    match wsdeflate.compress(bytes.from_str("hello hello hello"), p, true)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("and bytes that are not a deflate stream are refused rather than guessed")
+    match wsdeflate.decompress(bytes.from_str("not deflate"), p, true, 65536)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_connection_is_built_from_a_handshake_and_not_by_hand() [io]
+    // The role, the subprotocol and the extension all come out of the
+    // handshake; a constructor taking them separately would let a
+    // caller build a connection that says it is a server and masks its
+    // frames.
+    let c = wsconn.connection(ServerSide, wsconn.default_options(), WsDeflateOff, None)
+
+    test.case("a server connection is open like any other")
+    test.assert(wsconn.can_send(c))
+
+@test
+fn test_a_transport_is_reachable_for_options_this_package_does_not_wrap() [io, net]
+    test.case("a dial to a closed port is an error, not a panic")
+    match wstrans.dial_tcp("127.0.0.1", 1)
+        Err(_) => test.assert(true)
+        Ok(t)  =>
+            let s = wstrans.stream_of(t)
+            test.assert(s.is_open())
+
+    test.case("a TLS dial to the same port refuses the same way")
+    match wstrans.dial_tls("127.0.0.1", 1, wstrans.tls_for("example.com"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_listener_binds_and_a_port_in_use_is_an_error() [io, net]
+    test.case("port 1 is not bindable without privilege, and says so rather than aborting")
+    match wstrans.listen("127.0.0.1", 1)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)

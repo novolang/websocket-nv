@@ -1,0 +1,466 @@
+// wsconn.nv — the connection value, and the close handshake that is
+// the half of RFC 6455 everybody gets wrong.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING VALUE IS `WsConnState`, AND THE REASON IS ITS TWO
+// CLOSING STATES.  A WebSocket does not close; it performs a
+// handshake, and the handshake is not symmetric:
+//
+//   WsOpen           both directions carry data
+//   WsClosingLocal   we sent a close; the peer may still send DATA,
+//                    and we must still read it and answer its pings
+//   WsClosingRemote  the peer sent a close; we may send our close and
+//                    nothing else, and then the socket goes
+//   WsClosed         a close went each way, in some order
+//   WsFailed         the TCP connection went without a close frame —
+//                    1006, and 1006 may never be put on a wire
+//
+// A library that modelled this as one boolean — "closed" — makes four
+// specific bugs unavoidable, and all four are Autobahn cases.  A
+// client that stops reading after sending its close never sees the
+// peer's answer and reports every clean shutdown as an abort.  One
+// that keeps sending after the close sends frames a conforming peer
+// must fail the connection over.  One that cannot tell a close frame
+// from a dropped socket reports 1006 for both, and then sends 1006
+// back, which is the one code RFC 6455 § 7.4.1 says must never travel.
+// And one with no deadline on the wait waits forever against a peer
+// that has crashed.
+//
+// SO THERE ARE TWO DEADLINES, and they are different numbers: how long
+// to wait for the peer's close after sending ours (§ 7.1.1), and how
+// long to wait for a pong after sending a ping.  The first is the
+// protocol's; the second is the caller's policy and the RFC requires
+// no ping at all.
+//
+// THE CLOCK IS AN ARGUMENT, for the reason it is one in mqtt-nv: both
+// deadlines become tables, a caller driving many connections reads its
+// clock once per turn, and `now_ms` below is the only function in the
+// package that reads one.
+//
+// WHAT THIS PACKAGE ANSWERS WITHOUT BEING ASKED.  A ping is answered
+// with a pong carrying the same payload, a close is answered with a
+// close, and a decode fault is answered with the close code
+// `wsclose.close_code_for` names — all inside `pump`, all before the
+// error reaches the caller.  Those are the three things RFC 6455 says
+// an endpoint MUST do, and a library that returned them as work for
+// the caller would be a library whose callers each forget a different
+// one.
+
+// Where a connection is.
+pub enum WsConnState
+    // Both directions carry data.
+    WsOpen
+    // We sent a close frame.  The peer may still send data, and we
+    // must still read it and answer its pings.
+    WsClosingLocal
+    // The peer sent a close frame.  We may send ours and nothing
+    // else.
+    WsClosingRemote
+    // A close went each way.
+    WsClosed
+    // The TCP connection ended with no close frame.  1006, which is
+    // reported and never sent.
+    WsFailed
+
+// What a caller decides before a connection exists.
+pub struct WsConnOptions
+    // The codec's reassembly and frame limits, handed to
+    // `wsread.reader`.  `max_message = 0` turns reassembly off, for a
+    // caller streaming something too large to hold.
+    limits: WsLimits
+    // How long to wait for the peer's close after sending ours, in
+    // milliseconds.  RFC 6455 § 7.1.1's "reasonable time".
+    close_timeout_ms: Int
+    // How long to wait for a pong after sending a ping.  Zero turns
+    // the check off, which is what a caller behind a load balancer
+    // that pings for it wants.
+    pong_timeout_ms: Int
+    // How often to send a ping on an idle connection.  Zero sends
+    // none.
+    ping_interval_ms: Int
+    // The largest frame payload this endpoint will SEND; a longer
+    // message is fragmented across that many frames.
+    max_send_frame: Int
+    // Whether to compress outgoing messages when the extension was
+    // negotiated and `wsdeflate.worth_compressing` says yes.
+    compress_outgoing: Bool
+
+// A WebSocket connection, after the handshake.
+pub struct WsConn
+    // Which end this is.  The codec takes it as an argument to every
+    // decode for a reason — a proxy holds both halves and must not mix
+    // them — and it is a field here because one `WsConn` is one end.
+    role: WsRole
+    state: WsConnState
+    opts: WsConnOptions
+    // The codec's reader, carrying what arrived and did not yet make a
+    // whole frame.
+    reader: WsReader
+    // What permessage-deflate negotiated, or that it did not.
+    deflate: WsDeflateState
+    // The subprotocol both sides agreed on, if any.
+    subprotocol: ?Str
+    // Clock readings, in the host's milliseconds.
+    last_received_ms: Int
+    last_ping_sent_ms: Int
+    close_sent_ms: Int
+    // Whether a ping is outstanding.
+    ping_pending: Bool
+    // The close this endpoint sent, and the one the peer sent.  Both
+    // are needed: the status a program reports is the peer's, and the
+    // one it must not contradict is its own.
+    close_sent: ?WsClose
+    close_received: ?WsClose
+
+// What a turn of the caller's loop taught it.
+pub enum WsConnEvent
+    // A whole message arrived, reassembled.  `WsMessage` is the
+    // codec's, so a text message is bytes and not `Str` — RFC 6455
+    // § 8.1 makes invalid UTF-8 a close with code 1007, and the
+    // invalid case has to be representable long enough to be reported.
+    WsMessageReceived(msg: WsMessage)
+    // A fragment arrived on a connection whose `max_message` is 0, so
+    // nothing is being reassembled and the caller is streaming.
+    WsFragmentReceived(frame: WsFrame)
+    // The peer pinged and this package has already answered.  Reported
+    // because a caller may want to know the peer is alive, never
+    // because there is anything to do.
+    WsPingAnswered(payload: [u8])
+    // A pong arrived, this long after the ping went out.
+    WsPongReceived(round_trip_ms: Int)
+    // The peer began the close handshake with this close, and this
+    // package has already answered it.
+    WsCloseReceived(close: WsClose)
+    // Both closes have now gone, and the transport may be closed.
+    WsCloseCompleted
+
+// One turn of the caller's loop.
+pub struct WsTurn
+    // The connection after the turn.
+    conn: WsConn
+    // What happened, in the order it happened.
+    events: [WsConnEvent]
+    // How long the caller may wait before pumping again, in
+    // milliseconds from the `now_ms` it passed in: the sooner of the
+    // ping interval and whichever deadline is running.  Zero means
+    // come back immediately.
+    wait_ms: Int
+
+// The default options: the codec's default limits, a five-second close
+// timeout, a ten-second pong timeout, a thirty-second ping interval,
+// 64 KiB frames and compression on where it was negotiated.
+//
+// ```novo
+// use wsconn
+//
+// fn main() [io]
+//     println("${wsconn.default_options().close_timeout_ms}")
+// ```
+pub fn default_options() -> WsConnOptions []
+    todo("websocket-nv.wsconn.default_options")
+
+// The options with no timers at all: no ping, no pong deadline, and a
+// close timeout only.
+//
+// For a caller whose transport already has a keep-alive — a load
+// balancer that pings, a unix socket, a test — and which would
+// otherwise be answering a ping it does not need.
+//
+// ```novo
+// use wsconn
+//
+// fn main() [io]
+//     println("${wsconn.quiet_options().ping_interval_ms}")
+// ```
+pub fn quiet_options() -> WsConnOptions []
+    todo("websocket-nv.wsconn.quiet_options")
+
+// A connection over a completed handshake.
+//
+// Built by `wsclient.connect` and `wsserve.upgrade` rather than by a
+// caller: the role, the subprotocol and the negotiated extension all
+// come out of the handshake, and a constructor that took them
+// separately would let a caller build a connection that says it is a
+// server and masks its frames.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn made(r: WsRole, o: WsConnOptions, d: WsDeflateState) -> WsConn
+//     wsconn.connection(r, o, d, None)
+// ```
+pub fn connection(role: WsRole, o: WsConnOptions, d: WsDeflateState, subprotocol: ?Str) -> WsConn []
+    todo("websocket-nv.wsconn.connection")
+
+// Where the connection is.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn open(c: WsConn) -> Bool
+//     match wsconn.state_of(c)
+//         WsOpen => true
+//         _      => false
+// ```
+pub fn state_of(c: WsConn) -> WsConnState []
+    todo("websocket-nv.wsconn.state_of")
+
+// True while data may still be SENT — which is only in `WsOpen`.
+//
+// A separate question from `state_of` because it is the one a caller
+// asks before every send, and answering it with a match on five
+// variants at every call site is how a caller ends up getting one of
+// them wrong.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn can_write(c: WsConn) -> Bool
+//     wsconn.can_send(c)
+// ```
+pub fn can_send(c: WsConn) -> Bool []
+    todo("websocket-nv.wsconn.can_send")
+
+// True while data may still ARRIVE — which is in `WsOpen` and in
+// `WsClosingLocal`.
+//
+// The asymmetry with `can_send` is the whole close handshake.  An
+// endpoint that has sent its close must keep reading: the peer's
+// remaining data frames are legal, its pings must still be answered,
+// and its close is the thing being waited for.  A client that stopped
+// reading here reports every clean shutdown as an abort.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn keep_reading(c: WsConn) -> Bool
+//     wsconn.can_receive(c)
+// ```
+pub fn can_receive(c: WsConn) -> Bool []
+    todo("websocket-nv.wsconn.can_receive")
+
+// A monotonic millisecond reading.
+//
+// The one function in this package that reads a clock, and the only
+// `[time]` row in it.
+//
+// ```novo
+// use wsconn
+//
+// fn main() [io, time]
+//     println("${wsconn.now_ms() >= 0}")
+// ```
+pub fn now_ms() -> Int [time]
+    todo("websocket-nv.wsconn.now_ms")
+
+// One turn: read what the transport has, answer what must be answered,
+// send a ping if one is due, and fail the connection if a deadline has
+// passed.
+//
+// Effect-polymorphic: it costs whatever the transport costs.
+//
+// The pings, the pongs, the close echo and the protocol-error close
+// all happen INSIDE this function.  They are the three things RFC 6455
+// says an endpoint MUST do, and returning them as work for the caller
+// is how a library ends up with callers that each forget a different
+// one.
+//
+// ```novo ignore
+// use wsconn
+// use wstrans
+//
+// fn turn(c: WsConn, t: WsTcp) -> Result<WsTurn, WsConnError> [io, net, time]
+//     wsconn.pump(c, t, wsconn.now_ms())
+// ```
+pub fn pump<T: WsTransport[e]>(c: WsConn, t: T, now_ms: Int) -> Result<WsTurn, WsConnError> [e]
+    todo("websocket-nv.wsconn.pump")
+
+// Send a text message.
+//
+// The payload is bytes and not `Str` for the codec's reason: RFC 6455
+// § 8.1 requires an endpoint to fail the connection with 1007 on
+// invalid UTF-8, so the invalid case has to be representable.
+// `wsread.is_valid_utf8` is the check a caller makes first if it wants
+// to fail earlier than the peer would.
+//
+// ```novo ignore
+// use wsconn
+// use wstrans
+//
+// fn say(c: WsConn, t: WsTcp, utf8: [u8]) -> Result<WsTurn, WsConnError> [io, net, time]
+//     wsconn.send_text(c, t, utf8, wsconn.now_ms())
+// ```
+pub fn send_text<T: WsTransport[e]>(c: WsConn, t: T, utf8: [u8],
+                                    now_ms: Int) -> Result<WsTurn, WsConnError> [e]
+    todo("websocket-nv.wsconn.send_text")
+
+// Send a binary message.
+//
+// ```novo ignore
+// use wsconn
+// use wstrans
+//
+// fn say(c: WsConn, t: WsTcp, data: [u8]) -> Result<WsTurn, WsConnError> [io, net, time]
+//     wsconn.send_binary(c, t, data, wsconn.now_ms())
+// ```
+pub fn send_binary<T: WsTransport[e]>(c: WsConn, t: T, data: [u8],
+                                      now_ms: Int) -> Result<WsTurn, WsConnError> [e]
+    todo("websocket-nv.wsconn.send_binary")
+
+// Send one fragment of a message the caller is streaming.
+//
+// For a payload too large to hold: the caller sends the first fragment
+// with `fin` false and the last with it true, and no message ever
+// exists in memory whole.  The counterpart of `WsLimits.max_message`
+// being 0 on the receiving side.
+//
+// ```novo ignore
+// use wsconn
+// use wstrans
+//
+// fn chunk(c: WsConn, t: WsTcp, part: [u8], last: Bool) -> Result<WsTurn, WsConnError> [io, net, time]
+//     wsconn.send_fragment(c, t, part, last, wsconn.now_ms())
+// ```
+pub fn send_fragment<T: WsTransport[e]>(c: WsConn, t: T, part: [u8], fin: Bool,
+                                        now_ms: Int) -> Result<WsTurn, WsConnError> [e]
+    todo("websocket-nv.wsconn.send_fragment")
+
+// Send a ping with a payload of the caller's choosing.
+//
+// At most 125 bytes — `wsframe.CONTROL_PAYLOAD_MAX` — because a
+// control frame may not be fragmented and may not be long.
+//
+// ```novo ignore
+// use wsconn
+// use wstrans
+//
+// fn probe(c: WsConn, t: WsTcp) -> Result<WsTurn, WsConnError> [io, net, time]
+//     wsconn.send_ping(c, t, [], wsconn.now_ms())
+// ```
+pub fn send_ping<T: WsTransport[e]>(c: WsConn, t: T, payload: [u8],
+                                    now_ms: Int) -> Result<WsTurn, WsConnError> [e]
+    todo("websocket-nv.wsconn.send_ping")
+
+// Begin the close handshake.
+//
+// This SENDS a close frame and moves to `WsClosingLocal`.  It does not
+// close the transport and it does not wait: the caller keeps pumping
+// until a `WsCloseCompleted` event or a `WsCloseTimedOut` error, and
+// only then closes the socket.  A function that closed the transport
+// here would be a function that throws away the peer's answer, which
+// is the status the program was about to report.
+//
+// ```novo ignore
+// use wsconn
+// use wstrans
+//
+// fn bye(c: WsConn, t: WsTcp, k: WsClose) -> Result<WsTurn, WsConnError> [io, net, time]
+//     wsconn.close(c, t, k, wsconn.now_ms())
+// ```
+pub fn close<T: WsTransport[e]>(c: WsConn, t: T, k: WsClose,
+                                now_ms: Int) -> Result<WsTurn, WsConnError> [e]
+    todo("websocket-nv.wsconn.close")
+
+// The close the peer sent, once it has.
+//
+// The status a program reports.  `None` on a connection that is still
+// open, and `None` on one that failed — which is 1006, the code that
+// exists precisely so that "the socket went" is distinguishable from
+// "the peer said goodbye", and which may never be sent.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn why(c: WsConn) -> ?WsClose
+//     wsconn.peer_close(c)
+// ```
+pub fn peer_close(c: WsConn) -> ?WsClose []
+    todo("websocket-nv.wsconn.peer_close")
+
+// The close this endpoint sent, once it has.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn ours(c: WsConn) -> ?WsClose
+//     wsconn.local_close(c)
+// ```
+pub fn local_close(c: WsConn) -> ?WsClose []
+    todo("websocket-nv.wsconn.local_close")
+
+// How long the caller may wait before pumping again.
+//
+// The same number `WsTurn.wait_ms` carries, for a caller computing a
+// select timeout across many connections before it blocks on any.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn budget(c: WsConn, now_ms: Int) -> Int
+//     wsconn.wait_ms(c, now_ms)
+// ```
+pub fn wait_ms(c: WsConn, now_ms: Int) -> Int []
+    todo("websocket-nv.wsconn.wait_ms")
+
+// True when the close handshake has been waiting longer than
+// `close_timeout_ms`.
+//
+// RFC 6455 § 7.1.1 lets an endpoint drop the TCP connection after a
+// reasonable time rather than waiting forever for a peer that has
+// crashed.  A number, so the "reasonable time" is the caller's and is
+// assertable.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn give_up(c: WsConn, now_ms: Int) -> Bool
+//     wsconn.close_expired(c, now_ms)
+// ```
+pub fn close_expired(c: WsConn, now_ms: Int) -> Bool []
+    todo("websocket-nv.wsconn.close_expired")
+
+// True when a ping has gone unanswered longer than `pong_timeout_ms`.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn dead(c: WsConn, now_ms: Int) -> Bool
+//     wsconn.pong_expired(c, now_ms)
+// ```
+pub fn pong_expired(c: WsConn, now_ms: Int) -> Bool []
+    todo("websocket-nv.wsconn.pong_expired")
+
+// True when a ping is due at this reading.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn ping_now(c: WsConn, now_ms: Int) -> Bool
+//     wsconn.ping_due(c, now_ms)
+// ```
+pub fn ping_due(c: WsConn, now_ms: Int) -> Bool []
+    todo("websocket-nv.wsconn.ping_due")
+
+// The subprotocol the handshake settled on, if any.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn which(c: WsConn) -> ?Str
+//     wsconn.subprotocol_of(c)
+// ```
+pub fn subprotocol_of(c: WsConn) -> ?Str []
+    todo("websocket-nv.wsconn.subprotocol_of")
+
+// What permessage-deflate negotiated on this connection, or that it
+// did not.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn ext(c: WsConn) -> WsDeflateState
+//     wsconn.deflate_of(c)
+// ```
+pub fn deflate_of(c: WsConn) -> WsDeflateState []
+    todo("websocket-nv.wsconn.deflate_of")

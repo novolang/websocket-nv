@@ -1,0 +1,236 @@
+// wsserve.nv — the server side of the upgrade, and the accept-loop
+// shape an HTTP server takes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A WEBSOCKET SERVER IS AN HTTP SERVER WITH ONE MORE ROUTE, and the
+// shape here exists so that stays true.  `orbit/http-server` already
+// has an accept loop, a router and a request type; what it does not
+// have is a way for one route to say "this exchange stops being HTTP
+// now".  So this module takes an `H1Request` — http-codec-nv's, the
+// same one the server already parsed — and answers either an
+// `H1Response` to write and forget, or a connection to keep.
+//
+// THE DECISION IS A VALUE, NOT A CALLBACK.  `upgrade` answers a
+// `WsUpgradeOutcome` rather than taking a handler, which is what lets
+// a server apply its own policy between parsing the request and
+// accepting it: authenticate the Origin, check a session cookie, count
+// connections per address, pick a subprotocol from the list the client
+// offered.  A function that took a handler would have to be given all
+// of that as options it does not understand.
+//
+// WHAT THIS PACKAGE WILL NOT DECIDE.  The codec declines to pick a
+// subprotocol or check the `Origin`, for the reason that picking would
+// be picking for every application built on it.  This package declines
+// the same two, one layer up, and hands the server the list and the
+// header instead — `choose_protocol` is a convenience over a preference
+// order the SERVER supplies, not a policy of its own.
+//
+// A REFUSED UPGRADE IS STILL AN HTTP RESPONSE, and getting that wrong
+// is the failure that looks like a hang.  A client whose handshake is
+// refused wants a status and a body it can show a person; a server
+// that closed the socket instead leaves it waiting for a response that
+// is never coming.  `refusal_response` is the answer, built from the
+// codec's `wserr.http_status_for`, and 426 with a
+// `Sec-WebSocket-Version` header is what a version mismatch gets.
+
+// What a server decides about an upgrade request.
+pub enum WsUpgradeOutcome
+    // Accept it: write this response, then the connection is a
+    // WebSocket.  The response is `H1Response` rather than bytes so a
+    // server can add its own headers — a `Set-Cookie`, a request id —
+    // before writing it.
+    WsUpgradeAccepted(response: H1Response, conn: WsConn)
+    // Refuse it: write this response and close.  A refusal is an
+    // ordinary HTTP exchange, and a server that closed the socket
+    // instead leaves the client waiting.
+    WsUpgradeRefusedWith(response: H1Response)
+    // Not an upgrade request at all — an ordinary HTTP request the
+    // server should route as it always would.  `None` would have been
+    // ambiguous with a refusal, and a server that conflated the two
+    // answers 400 to its own home page.
+    WsNotAnUpgrade
+
+// What a server is willing to accept.
+pub struct WsServerPolicy
+    // Subprotocols this server speaks, most preferred first.  The
+    // first one the client also offered is chosen; if none match, the
+    // handshake still succeeds with no subprotocol, which is what RFC
+    // 6455 § 4.2.2 requires — refusing would break every client that
+    // offered one optimistically.
+    protocols: [Str]
+    // The permessage-deflate parameters this server is willing to
+    // agree to, or `None` to decline the extension.  A server declines
+    // by leaving the header out, never by refusing the handshake.
+    deflate: ?WsDeflateParams
+    // The options every accepted connection starts with.
+    options: WsConnOptions
+
+// A server that accepts any Origin, speaks no subprotocol, declines
+// permessage-deflate and uses `wsconn.default_options`.
+//
+// Declining the extension is the default because agreeing to it
+// without `no_context_takeover` costs a 32 KiB window per connection
+// per direction, and a server that discovers that at ten thousand
+// connections discovers it as memory pressure rather than as a
+// setting.
+//
+// ```novo
+// use wsserve
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(wsserve.policy().protocols)
+//     println("${n}")
+// ```
+pub fn policy() -> WsServerPolicy []
+    todo("websocket-nv.wsserve.policy")
+
+// The subprotocols this server speaks, most preferred first.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn with(p: WsServerPolicy) -> WsServerPolicy
+//     wsserve.with_protocols(p, ["chat.v2", "chat.v1"])
+// ```
+pub fn with_protocols(p: WsServerPolicy, protocols: [Str]) -> WsServerPolicy []
+    todo("websocket-nv.wsserve.with_protocols")
+
+// Agree to permessage-deflate with parameters no wider than these.
+//
+// ```novo ignore
+// use wsdeflate
+// use wsserve
+//
+// fn with(p: WsServerPolicy) -> WsServerPolicy
+//     wsserve.with_deflate(p, wsdeflate.default_params())
+// ```
+pub fn with_deflate(p: WsServerPolicy, d: WsDeflateParams) -> WsServerPolicy []
+    todo("websocket-nv.wsserve.with_deflate")
+
+// The options every accepted connection starts with.
+//
+// ```novo ignore
+// use wsconn
+// use wsserve
+//
+// fn with(p: WsServerPolicy) -> WsServerPolicy
+//     wsserve.with_options(p, wsconn.quiet_options())
+// ```
+pub fn with_options(p: WsServerPolicy, o: WsConnOptions) -> WsServerPolicy []
+    todo("websocket-nv.wsserve.with_options")
+
+// True when a request is asking to become a WebSocket.
+//
+// The question a router asks before it does anything else, and it is
+// answered from the request alone: a `GET` on HTTP/1.1 with
+// `Connection: Upgrade` and `Upgrade: websocket`.  A server that
+// routed on the path instead would refuse an upgrade on a path it
+// serves files from, and accept one on a path it does not.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn asks(req: H1Request) -> Bool
+//     wsserve.is_upgrade(req)
+// ```
+pub fn is_upgrade(req: H1Request) -> Bool []
+    todo("websocket-nv.wsserve.is_upgrade")
+
+// What the server should do with this request.
+//
+// Performs nothing: it reads a request and answers a response and a
+// connection.  Writing the response and reading the socket afterwards
+// are the server's, which is what lets `orbit/http-server` keep its
+// own accept loop and add one route rather than adopting a loop from
+// here.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn decide(req: H1Request, p: WsServerPolicy) -> WsUpgradeOutcome
+//     wsserve.upgrade(req, p)
+// ```
+pub fn upgrade(req: H1Request, p: WsServerPolicy) -> WsUpgradeOutcome []
+    todo("websocket-nv.wsserve.upgrade")
+
+// The subprotocol this policy picks from the list a client offered, or
+// `None`.
+//
+// The server's preference order wins, not the client's, and that is
+// the right way round: the client's order is a wish and the server is
+// the one that has to implement whichever is chosen.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn pick(p: WsServerPolicy, offered: [Str]) -> ?Str
+//     wsserve.choose_protocol(p, offered)
+// ```
+pub fn choose_protocol(p: WsServerPolicy, offered: [Str]) -> ?Str []
+    todo("websocket-nv.wsserve.choose_protocol")
+
+// The `Origin` the request carried, if any.
+//
+// Published rather than checked.  A browser sends it and a
+// non-browser client need not, so an `Origin` policy is an
+// application's decision — and a library that enforced one would be
+// deciding for every application built on it, including the ones with
+// no browser anywhere near them.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn who(req: H1Request) -> ?Str
+//     wsserve.origin_of(req)
+// ```
+pub fn origin_of(req: H1Request) -> ?Str []
+    todo("websocket-nv.wsserve.origin_of")
+
+// The response a refused upgrade gets.
+//
+// A refusal is an ordinary HTTP exchange: a status the client can show
+// a person, and — for a version mismatch — the
+// `Sec-WebSocket-Version: 13` header RFC 6455 § 4.4 requires with a
+// 426.  A server that closed the socket instead leaves the client
+// waiting for a response that never comes.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn no(e: WsHandshakeError) -> H1Response
+//     wsserve.refusal_response(e)
+// ```
+pub fn refusal_response(e: WsHandshakeError) -> H1Response []
+    todo("websocket-nv.wsserve.refusal_response")
+
+// The bytes of an accepted or refused upgrade response.
+//
+// ```novo ignore
+// use wsserve
+//
+// fn out(resp: H1Response) -> Result<[u8], WsConnError>
+//     wsserve.response_bytes(resp)
+// ```
+pub fn response_bytes(resp: H1Response) -> Result<[u8], WsConnError> []
+    todo("websocket-nv.wsserve.response_bytes")
+
+// Read one upgrade request off a freshly accepted transport, decide,
+// write the answer, and hand back what to do next.
+//
+// The convenience for a server that is ONLY a WebSocket server and has
+// no HTTP routing to do.  `orbit/http-server` does not use it: it has
+// already parsed the request by the time it reaches the route, and
+// re-reading the socket here would read a request that is no longer
+// there.
+//
+// ```novo ignore
+// use wsserve
+// use wstrans
+//
+// fn serve(t: WsTcp, p: WsServerPolicy) -> Result<WsConn, WsConnError> [io, net]
+//     wsserve.accept_upgrade(t, p)
+// ```
+pub fn accept_upgrade<T: WsTransport[e]>(t: T, p: WsServerPolicy) -> Result<WsConn, WsConnError> [e]
+    todo("websocket-nv.wsserve.accept_upgrade")

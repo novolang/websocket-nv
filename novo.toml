@@ -1,0 +1,70 @@
+[package]
+name        = "websocket-nv"
+version     = "0.0.1"
+description = "The socket half of WebSocket, over websocket-codec-nv: the RFC 6455 upgrade handshake on both sides over http-codec-nv, a connection value with typed send and receive, reassembly limits, automatic ping answering, the close handshake with its two deadlines, permessage-deflate over flate-nv, and the accept-loop shape a server takes.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the rows are not all the same.  `wstrans` dials and
+# listens: `[io, net]` through `std.net`, `[net]` through `std.tls`,
+# which is the narrower of the two because that is what the TLS surface
+# declares.  `wsconn.now_ms` is the one function that reads a clock and
+# the only `[time]` row in the package.  Everything else — the options,
+# the deflate negotiation, the close-handshake arithmetic, the accept
+# policy — declares NOTHING, because a connection is a value and the
+# loop that drives it belongs to the caller.
+#
+# The driving functions are effect-POLYMORPHIC: `pump<T: WsTransport[e]>
+# (…) [e]` costs whatever the caller's transport costs.  TLS is a hook
+# rather than a dependency for exactly that reason: a program that
+# terminates TLS somewhere else, or that speaks WebSocket over a unix
+# socket, plugs its own transport in and pays for nothing it does not
+# use.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["websocket", "rfc6455", "client", "server", "upgrade", "permessage-deflate", "tls"]
+repository  = "https://github.com/novolang/websocket-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "WebSocket with a socket under it"
+
+[dependencies]
+# The `core` half of the split: every frame this package puts on a wire
+# was built there and every frame it reads was decoded there.  Nothing
+# in this package does frame arithmetic.
+websocket-codec-nv = "^0.0.3"
+
+# The handshake IS an HTTP/1.1 exchange (RFC 6455 § 4), and this
+# package names `H1Request` and `H1Response` in its own signatures, so
+# the dependency is declared rather than inherited.
+#
+# `^0.0.1` AND NOT `^0.0.2`, WHICH IS NOT A CHOICE.  Under the caret
+# rule a `0.0.x` version has no compatible neighbours, and
+# websocket-codec-nv 0.0.3 requires exactly 0.0.1; one version of a
+# package is built into a program, so a `^0.0.2` here is a closure that
+# does not resolve.  The line moves when the codec's does.
+http-codec-nv = "^0.0.1"
+
+# permessage-deflate (RFC 7692).  The negotiation, the sliding-window
+# parameters and the trailing four bytes every compressed message drops
+# are this package's; the DEFLATE itself is flate-nv's, in raw mode
+# with no zlib header.
+#
+# It is a dependency rather than an option because the extension
+# changes what RSV1 MEANS on the wire, and a package that negotiated it
+# without being able to decompress would be accepting frames it cannot
+# read.
+flate-nv = "^0.0.2"

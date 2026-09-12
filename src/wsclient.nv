@@ -1,0 +1,212 @@
+// wsclient.nv — the client side of the upgrade, which is an HTTP/1.1
+// exchange and sixteen random bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE RANDOMNESS IS THIS PACKAGE'S AND THE ARITHMETIC IS THE CODEC'S.
+// websocket-codec-nv takes the nonce as an argument, because `core`
+// has no `[rand]` and because a handshake that generated its own
+// entropy could not be tested against RFC 6455 § 1.3's own example.
+// This package is `host` and may draw it, so `connect` does — and
+// `connect_with_nonce` is beside it so the exchange stays assertable
+// here too.  That pair is the whole of what the split between the two
+// packages costs, and it is worth two functions.
+//
+// THE MASK KEYS ARE THE SAME DECISION, FOUR BYTES AT A TIME.  Every
+// client frame is masked with a fresh key (RFC 6455 § 5.3), a
+// fragmented message needs one per frame, and `wswrite.frame_count`
+// exists so a caller knows how many to draw before it draws them.
+// `wsconn.send_text` over a client connection draws them through
+// `mask_keys` below.
+//
+// AND THE MASK IS NOT SECURITY.  It exists so that an intermediary
+// that does not understand WebSocket cannot be tricked into
+// interpreting frame contents as a second HTTP request — cache
+// poisoning — which is why it is mandatory, why the key must be
+// unpredictable, and why a server must fail on an unmasked frame
+// rather than accepting it.
+
+// What a client offers in the handshake beyond the URL.
+pub struct WsClientRequest
+    // The address, from `wstrans.address_of`.
+    address: WsAddress
+    // Subprotocols this client speaks, most preferred first.  The
+    // server picks one or none, and a server that picks one the client
+    // did not offer is a failed handshake.
+    protocols: [Str]
+    // Extra request headers: `Authorization`, `Cookie`, `Origin`.
+    // `H1Headers` from http-codec-nv, so a caller that already built
+    // headers for an HTTP request reuses the type.
+    headers: H1Headers
+    // Whether to offer permessage-deflate, and with what parameters.
+    deflate: ?WsDeflateParams
+
+// A handshake that has been prepared and not yet sent.
+//
+// Published because the exchange is worth being able to inspect: the
+// request is what goes on the wire, and the nonce is what the answer
+// has to be checked against.
+pub struct WsClientHandshake
+    request: H1Request
+    nonce_key: Str
+    offered_protocols: [Str]
+    offered_deflate: ?WsDeflateParams
+
+// A request for a URL, with no extra headers and no subprotocols.
+//
+// ```novo
+// use wsclient
+// use wstrans
+//
+// fn main() [io]
+//     match wstrans.address_of("wss://example.com/chat")
+//         None    => println("not a websocket url")
+//         Some(a) => println(wsclient.request(a).address.host)
+// ```
+pub fn request(a: WsAddress) -> WsClientRequest []
+    todo("websocket-nv.wsclient.request")
+
+// The subprotocols this client speaks, most preferred first.
+//
+// ```novo ignore
+// use wsclient
+//
+// fn with(r: WsClientRequest) -> WsClientRequest
+//     wsclient.with_protocols(r, ["chat.v2", "chat.v1"])
+// ```
+pub fn with_protocols(r: WsClientRequest, protocols: [Str]) -> WsClientRequest []
+    todo("websocket-nv.wsclient.with_protocols")
+
+// Extra request headers.
+//
+// ```novo ignore
+// use wsclient
+//
+// fn with(r: WsClientRequest, h: H1Headers) -> WsClientRequest
+//     wsclient.with_headers(r, h)
+// ```
+pub fn with_headers(r: WsClientRequest, h: H1Headers) -> WsClientRequest []
+    todo("websocket-nv.wsclient.with_headers")
+
+// Offer permessage-deflate with these parameters.
+//
+// ```novo ignore
+// use wsclient
+// use wsdeflate
+//
+// fn with(r: WsClientRequest) -> WsClientRequest
+//     wsclient.with_deflate(r, wsdeflate.default_params())
+// ```
+pub fn with_deflate(r: WsClientRequest, p: WsDeflateParams) -> WsClientRequest []
+    todo("websocket-nv.wsclient.with_deflate")
+
+// Draw the sixteen random bytes a `Sec-WebSocket-Key` is.
+//
+// `[rand]`, and the only `[rand]` row in the package apart from
+// `mask_keys`.  A caller that has its own entropy — a device with a
+// hardware source, a test with a fixture — never calls this and uses
+// `handshake_with_nonce` instead.
+//
+// ```novo
+// use wsclient
+// use std.list
+//
+// fn main() [io, rand]
+//     println("${list.len(wsclient.nonce())}")
+// ```
+pub fn nonce() -> [u8] [rand]
+    todo("websocket-nv.wsclient.nonce")
+
+// Draw `count` four-byte mask keys.
+//
+// `wswrite.frame_count` says how many a message needs.  Drawn in one
+// call rather than one per frame because an entropy source is a
+// syscall on most machines and a 10 MB message fragmented at 64 KiB is
+// 160 of them.
+//
+// ```novo
+// use wsclient
+// use std.list
+//
+// fn main() [io, rand]
+//     println("${list.len(wsclient.mask_keys(3))}")
+// ```
+pub fn mask_keys(count: Int) -> [[u8]] [rand]
+    todo("websocket-nv.wsclient.mask_keys")
+
+// The handshake for a request, with a nonce this function draws.
+//
+// ```novo ignore
+// use wsclient
+//
+// fn shake(r: WsClientRequest) -> Result<WsClientHandshake, WsConnError> [rand]
+//     wsclient.handshake(r)
+// ```
+pub fn handshake(r: WsClientRequest) -> Result<WsClientHandshake, WsConnError> [rand]
+    todo("websocket-nv.wsclient.handshake")
+
+// The handshake for a request over a nonce the caller supplies.
+//
+// The testable half.  RFC 6455 § 1.3's example nonce produces its
+// example key, and a test asserts that here rather than asserting that
+// two random values are different.
+//
+// ```novo ignore
+// use wsclient
+//
+// fn shake(r: WsClientRequest, n: [u8]) -> Result<WsClientHandshake, WsConnError>
+//     wsclient.handshake_with_nonce(r, n)
+// ```
+pub fn handshake_with_nonce(r: WsClientRequest,
+                            nonce_bytes: [u8]) -> Result<WsClientHandshake, WsConnError> []
+    todo("websocket-nv.wsclient.handshake_with_nonce")
+
+// Check the server's response against a prepared handshake, and build
+// the connection it settled on.
+//
+// Four things are checked and every one of them is a failure a client
+// that skipped it turns into a corrupt stream rather than an error:
+// the status is 101, the accept value is `sha1(key + GUID)` in base64,
+// any subprotocol named was one this client offered, and any extension
+// named was one this client offered with parameters no wider.
+//
+// ```novo ignore
+// use wsclient
+//
+// fn check(h: WsClientHandshake, resp: H1Response, o: WsConnOptions) -> Result<WsConn, WsConnError>
+//     wsclient.accept_response(h, resp, o)
+// ```
+pub fn accept_response(h: WsClientHandshake, resp: H1Response,
+                       o: WsConnOptions) -> Result<WsConn, WsConnError> []
+    todo("websocket-nv.wsclient.accept_response")
+
+// Perform the whole handshake over a transport: send the request, read
+// the response, check it, and answer the connection.
+//
+// Effect-polymorphic in the transport and `[rand]` besides, because it
+// draws the nonce.  A caller that wants neither uses
+// `handshake_with_nonce` and `accept_response` and drives the exchange
+// itself — which is what a test does, and what a program multiplexing
+// the handshake over an HTTP/1.1 connection it already holds does.
+//
+// ```novo ignore
+// use wsclient
+// use wstrans
+//
+// fn open(t: WsTcp, r: WsClientRequest, o: WsConnOptions) -> Result<WsConn, WsConnError> [io, net, rand]
+//     wsclient.connect(t, r, o)
+// ```
+pub fn connect<T: WsTransport[e]>(t: T, r: WsClientRequest,
+                                  o: WsConnOptions) -> Result<WsConn, WsConnError> [e, rand]
+    todo("websocket-nv.wsclient.connect")
+
+// The bytes of a prepared handshake request, ready for a transport.
+//
+// ```novo ignore
+// use wsclient
+//
+// fn out(h: WsClientHandshake) -> Result<[u8], WsConnError>
+//     wsclient.request_bytes(h)
+// ```
+pub fn request_bytes(h: WsClientHandshake) -> Result<[u8], WsConnError> []
+    todo("websocket-nv.wsclient.request_bytes")

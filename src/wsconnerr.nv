@@ -1,0 +1,137 @@
+// wsconnerr.nv — the ways a connection fails once there is a socket
+// under it, and the close code each one owes the peer.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// websocket-codec-nv ALREADY HAS THREE ERROR TYPES and this is the
+// fourth, not a fifth copy of them.  `WsDecodeError` is a frame that
+// was wrong, `WsEncodeError` is a frame this program tried to build
+// wrongly, `WsHandshakeError` is an upgrade that did not happen — and
+// all three are arithmetic over bytes the caller already held.  What
+// they cannot express is everything that goes wrong once a socket
+// exists: the peer that stopped answering, the close handshake that
+// timed out, the extension that was negotiated and then misbehaved.
+// Those are this type, and every variant carries the codec's own error
+// where one caused it rather than restating it.
+//
+// EVERY VARIANT NAME BEGINS `Ws`.  websocket-codec-nv's variants are
+// unprefixed — `NeedMore`, `ProtocolError`, `Complete`,
+// `InternalError` — and a variant is constructed by name across the
+// whole assembly, so an unprefixed variant here would bind to
+// whichever was declared first.
+
+// Why a connection ended, or could not start.
+pub enum WsConnError
+    // The transport said no.
+    WsSocketFailed(cause: IoError)
+    // The upgrade did not happen.  The codec's type, carried rather
+    // than copied: it already distinguishes a missing key from a wrong
+    // accept value from a version the server refuses.
+    WsUpgradeRefused(cause: WsHandshakeError)
+    // The server answered the upgrade with an ordinary HTTP response.
+    // Kept apart from `WsUpgradeRefused` because the status and the
+    // body are the server's explanation — a 401 with a WWW-Authenticate
+    // header is a connection the caller can retry with credentials, and
+    // a caller handed only "the handshake failed" cannot.
+    WsUpgradeAnswered(status: Int, body: [u8])
+    // A frame was wrong.  `wsclose.close_code_for` says what the peer
+    // is owed for it, and `pump` sends that before it reports this.
+    WsFrameRefused(cause: WsDecodeError)
+    // This program asked for a frame that cannot be built.
+    WsFrameNotBuildable(cause: WsEncodeError)
+    // The peer sent a close and never answered ours, or answered ours
+    // and never closed the socket.  RFC 6455 § 7.1.1 says an endpoint
+    // may drop the connection after a reasonable time; this is that
+    // time having passed.
+    WsCloseTimedOut(waited_ms: Int)
+    // A ping went unanswered for longer than the options allow.  Not a
+    // protocol fault — the RFC requires no ping at all — but the only
+    // way to tell a quiet peer from a dead network.
+    WsPongTimedOut(waited_ms: Int)
+    // The peer sent a compressed frame on a connection where
+    // permessage-deflate was not negotiated, or a compression
+    // parameter this package cannot honour.
+    WsExtensionNotNegotiated(name: Str)
+    // permessage-deflate was negotiated and the DEFLATE stream inside
+    // it did not decompress.
+    WsInflateFailed(cause: FlateError)
+    // A message reassembled past `WsLimits.max_message`.  The caller's
+    // own limit, reported rather than enforced silently, because the
+    // right answer is sometimes to raise it.
+    WsMessageTooLargeToAssemble(len: Int, limit: Int)
+    // A send on a connection that is closing or closed.  After a close
+    // frame has gone out, nothing else may follow it.
+    WsAlreadyClosing
+    // A close the peer initiated, reported as an error only to a caller
+    // that asked for `receive` and will never get one.  `WsConn.close`
+    // in `wsconn` is the ordinary path and this is not it.
+    WsPeerClosedFirst(close: WsClose)
+
+// The one-line reading, for a log or a person.
+//
+// ```novo
+// use wsconnerr
+//
+// fn main() [io]
+//     let e: WsConnError = WsAlreadyClosing
+//     println(e.message())
+// ```
+impl Error for WsConnError
+    fn message(self) -> Str
+        todo("websocket-nv.wsconnerr.message")
+
+// The close code this endpoint owes the peer for this fault, or `None`
+// where no close frame may be sent at all.
+//
+// `None` is the important half.  RFC 6455 § 7.4.1 reserves 1005, 1006
+// and 1015 as values an application reports to its own code and an
+// endpoint must never put on a wire, and a socket that has already
+// failed cannot carry a frame anyway — so a `WsSocketFailed` answers
+// `None` and a caller that sent something would be writing into a pipe
+// that is gone.
+//
+// ```novo
+// use wsconnerr
+//
+// fn main() [io]
+//     match wsconnerr.close_code_for(WsAlreadyClosing)
+//         Some(_) => println("tell the peer")
+//         None    => println("nothing to send")
+// ```
+pub fn close_code_for(e: WsConnError) -> ?WsCloseCode []
+    todo("websocket-nv.wsconnerr.close_code_for")
+
+// True when opening a NEW connection could succeed where this one
+// failed.
+//
+// A dropped socket and a timed-out pong are worth another attempt; a
+// server that answered the upgrade with 403, or a peer that closed
+// with 1008, has made a decision the same request will get again.
+//
+// ```novo
+// use wsconnerr
+//
+// fn main() [io]
+//     println("${wsconnerr.is_reconnectable(WsAlreadyClosing)}")
+// ```
+pub fn is_reconnectable(e: WsConnError) -> Bool []
+    todo("websocket-nv.wsconnerr.is_reconnectable")
+
+// The HTTP status a SERVER would answer a failed upgrade with, or
+// `None` for a fault that happened after the handshake succeeded.
+//
+// The codec's `wserr.http_status_for` answers this for a handshake
+// error; this is the same question asked of the wider type, so a
+// server's accept loop has one call rather than a match that has to
+// know which faults are handshake faults.
+//
+// ```novo
+// use wsconnerr
+//
+// fn main() [io]
+//     match wsconnerr.http_status_for(WsAlreadyClosing)
+//         Some(_) => println("answer it")
+//         None    => println("too late for a status")
+// ```
+pub fn http_status_for(e: WsConnError) -> ?Int []
+    todo("websocket-nv.wsconnerr.http_status_for")

@@ -1,0 +1,238 @@
+// wsdeflate.nv — permessage-deflate (RFC 7692), which is a negotiation
+// and four bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE PERFORMS ANYTHING — every row is `[]`.  The negotiation
+// is string handling over a header, the parameters are integers, and
+// the compression itself is flate-nv's, in raw mode.  A caller can
+// therefore assert what a given `Sec-WebSocket-Extensions` header
+// negotiates to without a socket, which matters because the
+// negotiation is the part implementations disagree about.
+//
+// THE FOUR BYTES ARE THE WHOLE TRICK, AND THEY ARE WHY THIS IS NOT
+// JUST "DEFLATE THE PAYLOAD".  RFC 7692 § 7.2.1 says a sender
+// compresses the message, then REMOVES the trailing `00 00 FF FF`
+// before putting it in the frame; a receiver appends those same four
+// bytes before inflating.  They are DEFLATE's empty-stored-block
+// marker, and dropping them is what lets one DEFLATE stream span many
+// messages without each one paying for a flush.  An implementation
+// that forgets either half produces frames that decompress to nothing
+// on every other implementation, and the failure looks like corruption
+// rather than like a missing four bytes.
+//
+// AND `no_context_takeover` IS A MEMORY DECISION, NOT A SPEED ONE.
+// Without it, each side keeps a 32 KiB sliding window per connection
+// for the life of the connection — which on a server with ten thousand
+// connections is 640 MB of window it did not ask for.  A server that
+// negotiated permessage-deflate without asking for
+// `server_no_context_takeover` has agreed to that; the default here
+// asks for it, and the README says so.
+
+// What one side offered or accepted.
+pub struct WsDeflateParams
+    // Do not carry the compression window between messages.  Costs
+    // compression ratio and saves a window per connection per
+    // direction.
+    server_no_context_takeover: Bool
+    client_no_context_takeover: Bool
+    // The window size, as the base-two logarithm: 8 to 15, so 256
+    // bytes to 32 KiB.  RFC 7692 § 7.1.2.
+    server_max_window_bits: Int
+    client_max_window_bits: Int
+
+// A negotiated extension, or the fact that none was.
+pub enum WsDeflateState
+    // The header named nothing this package understands, or named
+    // nothing at all.  RSV1 set on a frame is then `ReservedBitSet`,
+    // which is what a conforming endpoint that negotiated nothing must
+    // answer.
+    WsDeflateOff
+    // Negotiated, with these parameters, which both sides agreed to.
+    WsDeflateOn(params: WsDeflateParams)
+
+// The smallest window the RFC allows, 8 — a 256-byte history.
+pub const WS_DEFLATE_MIN_WINDOW_BITS = 8
+
+// The largest, 15 — a 32 KiB history, and DEFLATE's own maximum.
+pub const WS_DEFLATE_MAX_WINDOW_BITS = 15
+
+// The four bytes a sender drops and a receiver appends.
+pub const WS_DEFLATE_TAIL_LEN = 4
+
+// The extension's name as it appears in the header.
+pub const WS_PERMESSAGE_DEFLATE = "permessage-deflate"
+
+// The parameters a client offers by default: both sides asked to drop
+// their context, and the largest window on both.
+//
+// Asking for `no_context_takeover` costs ratio and saves a window per
+// direction per connection, and the caller who wants the ratio back
+// says so — which is the right way round, because the cost of the
+// other default is paid by a server with ten thousand connections and
+// is invisible until it is.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println("${wsdeflate.default_params().server_max_window_bits}")
+// ```
+pub fn default_params() -> WsDeflateParams []
+    todo("websocket-nv.wsdeflate.default_params")
+
+// The `Sec-WebSocket-Extensions` value a client offers for these
+// parameters.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println(wsdeflate.offer_header(wsdeflate.default_params()))
+// ```
+pub fn offer_header(p: WsDeflateParams) -> Str []
+    todo("websocket-nv.wsdeflate.offer_header")
+
+// What a server accepts from a client's offer, given its own limits,
+// or `WsDeflateOff` if it declines.
+//
+// A server MAY decline any offer and MUST NOT accept parameters
+// outside what the client offered.  The asymmetry is the rule that
+// gets broken: a server may narrow a window the client offered and may
+// not widen it, and a server that echoed its own preference back
+// regardless produces a connection where the two sides have different
+// windows and every message after the first is corrupt.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     match wsdeflate.accept_offer("permessage-deflate", wsdeflate.default_params())
+//         WsDeflateOn(_) => println("negotiated")
+//         WsDeflateOff   => println("declined")
+// ```
+pub fn accept_offer(offered: Str, limits: WsDeflateParams) -> WsDeflateState []
+    todo("websocket-nv.wsdeflate.accept_offer")
+
+// What a client makes of the server's answer: the negotiated state, or
+// why the answer was not acceptable.
+//
+// A server that answered with a parameter the client did not offer is
+// a failed handshake and not a narrowed one — RFC 7692 § 5.1 — because
+// the client has already decided how much memory it was going to
+// spend.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     match wsdeflate.check_answer("permessage-deflate", wsdeflate.default_params())
+//         Ok(_)  => println("agreed")
+//         Err(_) => println("refused")
+// ```
+pub fn check_answer(answered: Str,
+                    offered: WsDeflateParams) -> Result<WsDeflateState, WsHandshakeError> []
+    todo("websocket-nv.wsdeflate.check_answer")
+
+// The `Sec-WebSocket-Extensions` value a server answers with.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println(wsdeflate.answer_header(wsdeflate.default_params()))
+// ```
+pub fn answer_header(p: WsDeflateParams) -> Str []
+    todo("websocket-nv.wsdeflate.answer_header")
+
+// The header name both sides use.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println(wsdeflate.extensions_header())
+// ```
+pub fn extensions_header() -> Str []
+    todo("websocket-nv.wsdeflate.extensions_header")
+
+// A message's payload, compressed and with the trailing four bytes
+// already removed — ready to be a frame with RSV1 set.
+//
+// The removal is inside this function rather than the caller's because
+// it is the step every implementation forgets once.
+//
+// ```novo
+// use wsdeflate
+// use std.bytes
+//
+// fn main() [io]
+//     let p = wsdeflate.default_params()
+//     match wsdeflate.compress(bytes.from_str("hello"), p, true)
+//         Ok(_)  => println("compressed")
+//         Err(_) => println("refused")
+// ```
+pub fn compress(payload: Bytes, p: WsDeflateParams, is_client: Bool) -> Result<Bytes, FlateError> []
+    todo("websocket-nv.wsdeflate.compress")
+
+// A compressed payload inflated, with the trailing four bytes appended
+// first.
+//
+// ```novo
+// use wsdeflate
+// use std.bytes
+//
+// fn main() [io]
+//     let p = wsdeflate.default_params()
+//     match wsdeflate.decompress(bytes.from_str(""), p, true, 65536)
+//         Ok(_)  => println("inflated")
+//         Err(_) => println("refused")
+// ```
+pub fn decompress(payload: Bytes, p: WsDeflateParams, is_client: Bool,
+                  max_out: Int) -> Result<Bytes, FlateError> []
+    todo("websocket-nv.wsdeflate.decompress")
+
+// The window bits this side must use for its OWN sends, given the
+// negotiated parameters and which side it is.
+//
+// One function rather than a field read, because the answer depends on
+// the role and picking the peer's number is a mistake that produces a
+// stream the peer cannot inflate — and only for messages long enough
+// to reach back past the smaller window, which is why it survives
+// testing.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println("${wsdeflate.send_window_bits(wsdeflate.default_params(), true)}")
+// ```
+pub fn send_window_bits(p: WsDeflateParams, is_client: Bool) -> Int []
+    todo("websocket-nv.wsdeflate.send_window_bits")
+
+// Whether this side must reset its compression context after every
+// message, given the negotiated parameters and its role.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println("${wsdeflate.resets_context(wsdeflate.default_params(), true)}")
+// ```
+pub fn resets_context(p: WsDeflateParams, is_client: Bool) -> Bool []
+    todo("websocket-nv.wsdeflate.resets_context")
+
+// True when a message this size is worth compressing at all.
+//
+// A short message compresses to more bytes than it started with, plus
+// a frame header that now carries RSV1, so a sender that compressed
+// everything sends more bytes and burns more CPU doing it.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println("${wsdeflate.worth_compressing(4)}")
+// ```
+pub fn worth_compressing(payload_len: Int) -> Bool []
+    todo("websocket-nv.wsdeflate.worth_compressing")

@@ -1,0 +1,237 @@
+// wsserve_tests.nv — the server's half of the upgrade, spelled in
+// http-codec-nv's own request type.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: websocket-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE REQUESTS BELOW ARE BUILT, NOT PARSED, and that is the point of
+// taking `H1Request` rather than bytes: `orbit/http-server` has already
+// parsed the request by the time it reaches the route that would
+// upgrade it, and a second parse here would be a second parser that
+// eventually disagrees with the first.  It also makes every case in
+// this file a value a reader can see.
+
+use std.test
+use std.list
+use wsclient
+use wsconn
+use wsdeflate
+use wsserve
+use wstrans
+
+fn headers_of(fields: [H1Header]) -> H1Headers
+    H1Headers { fields: fields }
+
+fn an_upgrade_request() -> H1Request
+    H1Request { method: Get, target: "/chat", version: Http11,
+                headers: headers_of([
+                    H1Header { name: "Host", value: "example.com" },
+                    H1Header { name: "Connection", value: "Upgrade" },
+                    H1Header { name: "Upgrade", value: "websocket" },
+                    H1Header { name: "Sec-WebSocket-Key", value: "dGhlIHNhbXBsZSBub25jZQ==" },
+                    H1Header { name: "Sec-WebSocket-Version", value: "13" },
+                    H1Header { name: "Origin", value: "https://example.com" }]) }
+
+fn a_plain_request() -> H1Request
+    H1Request { method: Get, target: "/index.html", version: Http11,
+                headers: headers_of([H1Header { name: "Host", value: "example.com" }]) }
+
+@test
+fn test_an_upgrade_is_recognised_from_the_request_and_not_the_path() [io]
+    // A server that routed on the path refuses an upgrade on a path it
+    // serves files from, and accepts one on a path it does not.
+    test.case("the upgrade headers say what this is")
+    test.assert(wsserve.is_upgrade(an_upgrade_request()))
+
+    test.case("and an ordinary GET is not one, whatever its path")
+    test.assert(not wsserve.is_upgrade(a_plain_request()))
+
+@test
+fn test_a_request_that_is_not_an_upgrade_gets_its_own_arm() [io]
+    // A server that conflated "this is not an upgrade" with "this
+    // upgrade is refused" answers 400 to its own home page.
+    match wsserve.upgrade(a_plain_request(), wsserve.policy())
+        WsNotAnUpgrade          => test.assert(true)
+        WsUpgradeAccepted(_, _) => test.assert(false)
+        WsUpgradeRefusedWith(_) => test.assert(false)
+
+@test
+fn test_a_good_upgrade_is_accepted_with_a_101_to_write() [io]
+    match wsserve.upgrade(an_upgrade_request(), wsserve.policy())
+        WsNotAnUpgrade          => test.assert(false)
+        WsUpgradeRefusedWith(_) => test.assert(false)
+        WsUpgradeAccepted(r, c) =>
+            test.case("the response is a 101 the server writes itself")
+            test.assert(r.status == 101)
+
+            test.case("and the connection it hands back is a server one")
+            test.assert(wsconn.can_send(c))
+
+@test
+fn test_a_wrong_version_is_refused_with_the_header_the_rfc_requires() [io]
+    // RFC 6455 § 4.4: a 426 carries `Sec-WebSocket-Version`, so the
+    // client learns which version would have worked.
+    let req = H1Request { method: Get, target: "/chat", version: Http11,
+                          headers: headers_of([
+                              H1Header { name: "Host", value: "example.com" },
+                              H1Header { name: "Connection", value: "Upgrade" },
+                              H1Header { name: "Upgrade", value: "websocket" },
+                              H1Header { name: "Sec-WebSocket-Key", value: "dGhlIHNhbXBsZSBub25jZQ==" },
+                              H1Header { name: "Sec-WebSocket-Version", value: "8" }]) }
+
+    match wsserve.upgrade(req, wsserve.policy())
+        WsNotAnUpgrade          => test.assert(false)
+        WsUpgradeAccepted(_, _) => test.assert(false)
+        WsUpgradeRefusedWith(r) => test.assert(r.status == 426)
+
+@test
+fn test_the_origin_is_handed_over_and_not_judged() [io]
+    // A browser sends it and a non-browser client need not, so a
+    // library that enforced a policy would be deciding for every
+    // application built on it — including the ones with no browser
+    // anywhere near them.
+    test.case("the header is readable")
+    match wsserve.origin_of(an_upgrade_request())
+        None    => test.assert(false)
+        Some(o) => test.assert(o == "https://example.com")
+
+    test.case("and a request without one is not refused for it")
+    match wsserve.origin_of(a_plain_request())
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_an_accepted_response_serialises_for_the_server_to_write() [io]
+    // The server writes it, not this package: that is what lets
+    // orbit/http-server add its own headers — a request id, a
+    // Set-Cookie — between the decision and the wire.
+    match wsserve.upgrade(an_upgrade_request(), wsserve.policy())
+        WsNotAnUpgrade          => test.assert(false)
+        WsUpgradeRefusedWith(_) => test.assert(false)
+        WsUpgradeAccepted(r, _) =>
+            match wsserve.response_bytes(r)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(list.len(b) > 0)
+
+@test
+fn test_the_policys_options_reach_the_connection_it_accepts() [io]
+    let p = wsserve.with_options(wsserve.policy(), wsconn.quiet_options())
+
+    match wsserve.upgrade(an_upgrade_request(), p)
+        WsNotAnUpgrade          => test.assert(false)
+        WsUpgradeRefusedWith(_) => test.assert(false)
+        WsUpgradeAccepted(_, c) =>
+            test.case("the quiet options turn the pings off on this connection")
+            test.assert(not wsconn.ping_due(c, 100000))
+
+@test
+fn test_a_client_checks_four_things_about_the_servers_answer() [io]
+    // Each is a failure a client that skipped it turns into a corrupt
+    // stream rather than an error.  The accept value here is RFC 6455
+    // § 1.3's own, for its own nonce.
+    let r = wsclient.request(WsAddress { secure: false, host: "example.com",
+                                         port: 80, target: "/chat" })
+    let nonce_bytes = [0x74, 0x68, 0x65, 0x20, 0x73, 0x61, 0x6D, 0x70,
+                       0x6C, 0x65, 0x20, 0x6E, 0x6F, 0x6E, 0x63, 0x65]
+
+    match wsclient.handshake_with_nonce(r, nonce_bytes)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("the RFC's own accept value is accepted")
+            let good = H1Response { version: Http11, status: 101, reason: "Switching Protocols",
+                                    headers: headers_of([
+                                        H1Header { name: "Upgrade", value: "websocket" },
+                                        H1Header { name: "Connection", value: "Upgrade" },
+                                        H1Header { name: "Sec-WebSocket-Accept",
+                                                   value: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" }]) }
+            match wsclient.accept_response(h, good, wsconn.default_options())
+                Err(_) => test.assert(false)
+                Ok(c)  => test.assert(wsconn.can_send(c))
+
+            test.case("and one byte wrong in it is refused")
+            let bad = H1Response { version: Http11, status: 101, reason: "Switching Protocols",
+                                   headers: headers_of([
+                                       H1Header { name: "Upgrade", value: "websocket" },
+                                       H1Header { name: "Connection", value: "Upgrade" },
+                                       H1Header { name: "Sec-WebSocket-Accept",
+                                                  value: "s3pPLMBiTxaQ9kYGzzhZRbK+xOp=" }]) }
+            match wsclient.accept_response(h, bad, wsconn.default_options())
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+            test.case("a 200 is not a handshake, whatever its headers say")
+            let wrong = H1Response { version: Http11, status: 200, reason: "OK",
+                                     headers: headers_of([]) }
+            match wsclient.accept_response(h, wrong, wsconn.default_options())
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+@test
+fn test_a_client_may_add_headers_of_its_own() [io]
+    // Authorization, Cookie, Origin: everything an application needs to
+    // authenticate an upgrade, and none of which this package knows
+    // about.
+    let extra = headers_of([H1Header { name: "Authorization", value: "Bearer x" }])
+    let r = wsclient.with_headers(
+        wsclient.request(WsAddress { secure: false, host: "example.com",
+                                     port: 80, target: "/chat" }),
+                                     extra)
+
+    match wsclient.handshake_with_nonce(r, [0x74, 0x68, 0x65, 0x20, 0x73, 0x61, 0x6D, 0x70,
+                                            0x6C, 0x65, 0x20, 0x6E, 0x6F, 0x6E, 0x63, 0x65])
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("the header is on the request that goes out")
+            test.assert(list.len(h.request.headers.fields) > 0)
+
+@test
+fn test_mask_keys_are_drawn_in_one_call_rather_than_one_per_frame() [io, rand]
+    // An entropy source is a syscall on most machines, and a 10 MB
+    // message fragmented at 64 KiB needs 160 keys.
+    let keys = wsclient.mask_keys(3)
+
+    test.case("three keys came back")
+    test.assert(list.len(keys) == 3)
+
+    test.case("each is four bytes, which is what RFC 6455 § 5.3 says")
+    test.assert(list.len(list.get(keys, 0)) == 4)
+
+    test.case("and a nonce is sixteen")
+    test.assert(list.len(wsclient.nonce()) == 16)
+
+@test
+fn test_a_websocket_only_server_can_take_the_whole_exchange() [io, net]
+    // The convenience for a server with no HTTP routing to do.
+    // orbit/http-server does not use it: it has already parsed the
+    // request by the time it reaches the route, and re-reading the
+    // socket here would read a request that is no longer there.
+    test.case("a transport that never connected has no upgrade to accept")
+    match wstrans.dial_tcp("127.0.0.1", 1)
+        Err(_) => test.assert(true)
+        Ok(t)  =>
+            match wsserve.accept_upgrade(t, wsserve.policy())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+@test
+fn test_a_server_that_agreed_to_deflate_answers_with_the_extension() [io]
+    let p = wsserve.with_deflate(wsserve.policy(), wsdeflate.default_params())
+    let req = H1Request { method: Get, target: "/chat", version: Http11,
+                          headers: headers_of([
+                              H1Header { name: "Host", value: "example.com" },
+                              H1Header { name: "Connection", value: "Upgrade" },
+                              H1Header { name: "Upgrade", value: "websocket" },
+                              H1Header { name: "Sec-WebSocket-Key", value: "dGhlIHNhbXBsZSBub25jZQ==" },
+                              H1Header { name: "Sec-WebSocket-Version", value: "13" },
+                              H1Header { name: "Sec-WebSocket-Extensions",
+                                         value: "permessage-deflate" }]) }
+
+    match wsserve.upgrade(req, p)
+        WsNotAnUpgrade          => test.assert(false)
+        WsUpgradeRefusedWith(_) => test.assert(false)
+        WsUpgradeAccepted(_, c) =>
+            test.case("the connection knows the extension was negotiated")
+            match wsconn.deflate_of(c)
+                WsDeflateOn(_) => test.assert(true)
+                WsDeflateOff   => test.assert(false)

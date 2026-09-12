@@ -1,0 +1,317 @@
+// wsconn_tests.nv — the close handshake, and the four Autobahn cases a
+// one-boolean connection cannot pass.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: websocket-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
+// `WsScript` below implements `WsTransport[]` — a transport over bytes
+// already in memory — and the functions that drive a connection over
+// it carry no effect row at all.  If `wsconn.pump` were secretly
+// effectful, or if the effect parameter did not flow from the impl to
+// the call, this file would not compile.  It is also the shape every
+// Autobahn case will be written in: a script of bytes and a table of
+// milliseconds, with no socket and no clock.
+
+use std.test
+use std.bytes
+use wsconn
+use wsclient
+use wsconnerr
+use wstrans
+
+// A transport over a script of bytes.  It performs nothing.
+struct WsScript
+    incoming: Bytes
+    open: Bool
+
+// A transport that costs nothing.
+//
+// ```novo ignore
+// use wsconn
+//
+// fn drive(c: WsConn, s: WsScript) -> Result<WsTurn, WsConnError>
+//     wsconn.pump(c, s, 0)
+// ```
+impl WsTransport[] for WsScript
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError>
+        Ok(bytes.len(data))
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError>
+        if self.open
+            Ok(self.incoming)
+        else
+            Ok(bytes.from_str(""))
+
+    fn ws_close(self) -> ?IoError
+        None
+
+    fn ws_is_open(self) -> Bool
+        self.open
+
+fn a_client_conn() -> WsConn
+    wsconn.connection(ClientSide, wsconn.default_options(), WsDeflateOff, None)
+
+fn a_script() -> WsScript
+    WsScript { incoming: bytes.from_str(""), open: true }
+
+@test
+fn test_a_fresh_connection_is_open_in_both_directions() [io]
+    let c = a_client_conn()
+
+    test.case("open")
+    match wsconn.state_of(c)
+        WsOpen => test.assert(true)
+        _      => test.assert(false)
+
+    test.case("data may be sent")
+    test.assert(wsconn.can_send(c))
+
+    test.case("and data may arrive")
+    test.assert(wsconn.can_receive(c))
+
+@test
+fn test_after_sending_a_close_we_must_keep_reading() [io]
+    // The Autobahn case a one-boolean connection fails: an endpoint
+    // that stops reading after sending its close never sees the peer's
+    // answer, and reports every clean shutdown as an abort.
+    let c = closing_local(a_client_conn(), a_script())
+
+    test.case("nothing more may be sent")
+    test.assert(not wsconn.can_send(c))
+
+    test.case("and the peer's answer is still coming, so we read on")
+    test.assert(wsconn.can_receive(c))
+
+fn closing_local(c: WsConn, s: WsScript) -> WsConn
+    match wsconn.close(c, s, WsClose { code: NormalClosure, reason: "" }, 0)
+        Ok(turn) => turn.conn
+        Err(_)   => c
+
+@test
+fn test_a_second_close_is_refused_rather_than_sent() [io]
+    // An endpoint that keeps sending after its close sends frames a
+    // conforming peer must fail the connection over.
+    let c = closing_local(a_client_conn(), a_script())
+
+    test.case("the second close is an error, not a frame")
+    match wsconn.close(c, a_script(), WsClose { code: GoingAway, reason: "" }, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_close_wait_has_a_deadline() [io]
+    // RFC 6455 § 7.1.1 lets an endpoint drop the TCP connection after a
+    // reasonable time rather than waiting forever for a peer that has
+    // crashed.  The default is five seconds, so the boundary is 5,000.
+    let c = closing_local(a_client_conn(), a_script())
+
+    test.case("not expired a second in")
+    test.assert(not wsconn.close_expired(c, 1000))
+
+    test.case("expired well past the timeout")
+    test.assert(wsconn.close_expired(c, 60000))
+
+@test
+fn test_the_two_deadlines_are_separate_numbers() [io]
+    // The close timeout is the protocol's and the pong timeout is the
+    // caller's policy; the RFC requires no ping at all.  Folding them
+    // into one number would make a connection behind a load balancer
+    // that pings for you either unable to close or unable to wait.
+    let o = wsconn.default_options()
+
+    test.case("a close deadline")
+    test.assert(o.close_timeout_ms > 0)
+
+    test.case("a pong deadline, and a different one")
+    test.assert(o.pong_timeout_ms != o.close_timeout_ms)
+
+    test.case("and the quiet options turn the pings off entirely")
+    test.assert(wsconn.quiet_options().ping_interval_ms == 0)
+
+@test
+fn test_a_fresh_connection_owes_no_pong_and_has_no_close_to_report() [io]
+    let c = a_client_conn()
+
+    test.case("no ping is outstanding, so nothing has expired")
+    test.assert(not wsconn.pong_expired(c, 100000))
+
+    test.case("the peer has not closed")
+    match wsconn.peer_close(c)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and neither have we")
+    match wsconn.local_close(c)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_ping_is_due_on_the_interval_and_not_before() [io]
+    // The default interval is thirty seconds.
+    let c = a_client_conn()
+
+    test.case("not due at the start")
+    test.assert(not wsconn.ping_due(c, 0))
+
+    test.case("due once the interval has passed")
+    test.assert(wsconn.ping_due(c, 30000))
+
+@test
+fn test_the_deadline_is_answerable_without_pumping() [io]
+    // A select over many connections computes its timeout from all of
+    // them before it blocks on any.
+    let c = a_client_conn()
+
+    test.case("bounded by the soonest timer")
+    test.assert(wsconn.wait_ms(c, 0) <= 30000)
+
+    test.case("and never negative")
+    test.assert(wsconn.wait_ms(c, 100000) >= 0)
+
+@test
+fn test_a_connection_over_a_pure_transport_declares_no_effects() [io]
+    // The signature of `driven` is the assertion, and the compiler has
+    // already checked it: no [io], no [net], no [time].
+    test.case("a turn over a script is a value computation")
+    match driven(a_client_conn(), a_script())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn driven(c: WsConn, s: WsScript) -> Result<WsTurn, WsConnError>
+    wsconn.pump(c, s, 0)
+
+@test
+fn test_every_send_is_generic_over_the_transport() [io]
+    let c = a_client_conn()
+    let s = a_script()
+
+    test.case("text")
+    match sent_text(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("binary")
+    match sent_binary(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("a fragment of something being streamed")
+    match sent_fragment(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("a ping")
+    match sent_ping(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn sent_text(c: WsConn, s: WsScript) -> Result<WsTurn, WsConnError>
+    wsconn.send_text(c, s, [0x68, 0x69], 0)
+
+fn sent_binary(c: WsConn, s: WsScript) -> Result<WsTurn, WsConnError>
+    wsconn.send_binary(c, s, [0x00, 0xFF], 0)
+
+fn sent_fragment(c: WsConn, s: WsScript) -> Result<WsTurn, WsConnError>
+    wsconn.send_fragment(c, s, [0x00], false, 0)
+
+fn sent_ping(c: WsConn, s: WsScript) -> Result<WsTurn, WsConnError>
+    wsconn.send_ping(c, s, [], 0)
+
+@test
+fn test_a_connection_reports_what_the_handshake_settled() [io]
+    let c = a_client_conn()
+
+    test.case("no subprotocol was agreed")
+    match wsconn.subprotocol_of(c)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and permessage-deflate was not negotiated")
+    match wsconn.deflate_of(c)
+        WsDeflateOff   => test.assert(true)
+        WsDeflateOn(_) => test.assert(false)
+
+@test
+fn test_the_clock_reader_is_the_one_function_with_a_time_row() [io, time]
+    test.case("a monotonic reading is not negative")
+    test.assert(wsconn.now_ms() >= 0)
+
+@test
+fn test_the_three_unsendable_close_codes_are_never_owed_to_a_peer() [io]
+    // 1005, 1006 and 1015 are values an application reports to its own
+    // code.  A socket that has already failed cannot carry a frame
+    // anyway, so the fault that means "the socket went" owes nothing.
+    test.case("a socket failure has no close code to send")
+    match wsconnerr.close_code_for(WsSocketFailed(IoBrokenPipe))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("a message that outgrew its limit does owe one")
+    match wsconnerr.close_code_for(WsMessageTooLargeToAssemble(70000, 65536))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+@test
+fn test_the_two_questions_a_connection_fault_has_to_answer() [io]
+    test.case("a dropped socket is worth another connection")
+    test.assert(wsconnerr.is_reconnectable(WsSocketFailed(IoBrokenPipe)))
+
+    test.case("a server that answered 403 will answer it again")
+    test.assert(not wsconnerr.is_reconnectable(WsUpgradeAnswered(403, [])))
+
+    test.case("a handshake fault has a status a server would answer with")
+    match wsconnerr.http_status_for(WsUpgradeRefused(MissingKey))
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+    test.case("and a fault after the handshake has none")
+    match wsconnerr.http_status_for(WsAlreadyClosing)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_the_two_default_ports_come_from_the_scheme() [io]
+    // The part a client gets wrong: wss:// is 443 and not 80, and a
+    // client that defaulted to 80 for both fails against every server
+    // listening on one.
+    test.case("ws:// is 80")
+    test.assert(wstrans.WS_PORT == 80)
+
+    test.case("wss:// is 443")
+    test.assert(wstrans.WSS_PORT == 443)
+
+    test.case("and a wss URL with no port takes 443")
+    match wstrans.address_of("wss://example.com/chat")
+        None    => test.assert(false)
+        Some(a) =>
+            test.assert(a.secure)
+            test.assert(a.port == 443)
+            test.assert(a.target == "/chat")
+
+    test.case("while a ws URL with no port takes 80")
+    match wstrans.address_of("ws://example.com/chat")
+        None    => test.assert(false)
+        Some(a) =>
+            test.assert(not a.secure)
+            test.assert(a.port == 80)
+
+    test.case("and an http URL is not a websocket address at all")
+    match wstrans.address_of("https://example.com/chat")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_whole_handshake_is_generic_over_the_transport_too() [io, rand]
+    // `connect` is `[e, rand]` — the transport's row plus the nonce —
+    // so over a script that performs nothing it costs only `[rand]`.
+    // The signature of `opened` is the assertion.
+    test.case("a handshake over a script draws entropy and nothing else")
+    match opened(a_script())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn opened(s: WsScript) -> Result<WsConn, WsConnError> [rand]
+    let a = WsAddress { secure: false, host: "example.com", port: 80, target: "/chat" }
+    wsclient.connect(s, wsclient.request(a), wsconn.default_options())
