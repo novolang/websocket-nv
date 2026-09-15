@@ -5,6 +5,10 @@ All notable changes to websocket-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -58,3 +62,18 @@ The **interface**: every signature and every effect row, and no bodies.
 - **No device claim.**  The package is `host`.
 - **Three `core` dependencies**: websocket-codec-nv, http-codec-nv and
   flate-nv, all of which are interfaces themselves today.
+
+### Design notes
+
+The reference implementations for the port are `tungstenite` for the
+client and the connection shape, `websockets` (Python) for the close
+handshake's two deadlines, and the Autobahn Testsuite as the oracle the
+finished implementation will be measured against. Three things change in
+the crossing. `tungstenite`'s `WebSocket<S>` is generic over a
+`Read + Write` stream; here the transport is `WsTransport[e]`, a trait
+of this package's own with four methods, one of which — `ws_is_open` —
+has no effect row, because a close handshake asks it on every turn. Its
+`Message::Text(String)` stays the codec's `TextMessage([u8])`, so
+invalid UTF-8 is reportable. And its internal `Instant`s become
+millisecond integers taken as arguments, which is what makes both
+deadlines assertable against a table.

@@ -1,6 +1,6 @@
 [package]
 name        = "websocket-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The socket half of WebSocket, over websocket-codec-nv: the RFC 6455 upgrade handshake on both sides over http-codec-nv, a connection value with typed send and receive, reassembly limits, automatic ping answering, the close handshake with its two deadlines, permessage-deflate over flate-nv, and the accept-loop shape a server takes.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
