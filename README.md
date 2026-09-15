@@ -124,7 +124,7 @@ fn talk(a: WsAddress) -> Result<WsConn, WsConnError> [io, net, rand, time]
 
 fn drive(t: WsTcp, a: WsAddress) -> Result<WsConn, WsConnError> [io, net, rand, time]
     // Perform the upgrade. The sixteen random bytes of the key are
-    // drawn here, which is the `[rand]` in this function's row.
+    // drawn here, which is why this function declares `[rand]`.
     var c: WsConn = wsclient.connect(t, wsclient.request(a), wsconn.default_options())!
 
     var reading = true
@@ -218,10 +218,10 @@ whatever that transport costs.
    breaks the protocol is answered with the close code
    `wsclose.close_code_for` names (section 7.4.1). All three happen
    before the caller sees anything.
-5. **The clock is an argument.** `wsconn.now_ms` is the only function in
-   the package that reads one, and it is the only `[time]` row. A caller
-   driving many connections reads its clock once per turn and passes the
-   same number to each.
+5. **The clock is an argument.** `wsconn.now_ms` is the only function
+   in the package that reads one, and the only one that declares
+   `[time]`. A caller driving many connections reads its clock once per
+   turn and passes the same number to each.
 6. **Both deadlines are yours, in milliseconds, and they are different
    numbers.** `close_timeout_ms` is the protocol's wait for the peer's
    close (section 7.1.1). `pong_timeout_ms` is policy, because RFC 6455
@@ -313,7 +313,7 @@ whatever that transport costs.
   mqtt-codec-nv. Reach for it where the link is constrained and the
   pattern is publish and subscribe.
 - `std.net` and `std.tls` in the standard library are what `WsTcp` and
-  `WsTls` are built on, and their effect rows are what those two cost.
+  `WsTls` are built on, and what they declare is what those two cost.
 - `std.ws` in the standard library is a different thing with the same
   name on the tin. It is a `WebSocket` handle and six methods that hand
   a `Str` or a `Bytes` to the runtime, where the framing happens outside
@@ -355,7 +355,8 @@ land.
 
 ## Implementation status
 
-The types, the enum variants and the effect rows are published in full.
+Every type, every enum variant and every declared effect is published
+in full.
 This table is about the function bodies.
 
 | Item | Implemented |
