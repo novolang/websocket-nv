@@ -160,7 +160,7 @@ implementation will have to satisfy.
 | Module | Contents |
 | --- | --- |
 | `wsconn` | The connection value, its five states, the options, the six events a turn can produce, and `pump`, which performs one turn. |
-| `wstrans` | The transport. A trait any byte pipe can implement, a TCP implementation, a TLS implementation, a listener, and the address a `ws://` or `wss://` URL names. |
+| `wstrans` | The transport. A trait any byte pipe can implement, a TCP implementation, a TLS implementation with its options record, a listener, and the address a `ws://` or `wss://` URL names. |
 | `wsclient` | The client side of the upgrade: the request a client offers, the random nonce and mask keys, and the check the server's answer has to pass. |
 | `wsserve` | The server side of the upgrade: what a server is willing to accept, the decision as a value, and the HTTP response a refusal gets. |
 | `wsdeflate` | permessage-deflate. The offer, the answer, the parameters, the four bytes RFC 7692 removes and appends, and whether a message is worth compressing. |
@@ -312,8 +312,13 @@ whatever that transport costs.
   for a different protocol: a client value a host pumps, over
   mqtt-codec-nv. Reach for it where the link is constrained and the
   pattern is publish and subscribe.
-- `std.net` and `std.tls` in the standard library are what `WsTcp` and
-  `WsTls` are built on, and what they declare is what those two cost.
+- `std.net` in the standard library is what `WsTcp` is built on, and
+  what it declares is what that transport costs. `WsTls` is written
+  against a TLS connection handle, and the options beside it are
+  `wstrans.WsTlsConfig` — this package's own record, because the
+  standard library's TLS surface is not published (there is no
+  `docs/stdlib/tls.md` and no module a `use` resolves), so no package
+  can name a type from it.
 - `std.ws` in the standard library is a different thing with the same
   name on the tin. It is a `WebSocket` handle and six methods that hand
   a `Str` or a `Bytes` to the runtime, where the framing happens outside

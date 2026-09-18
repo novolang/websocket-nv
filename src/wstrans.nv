@@ -3,7 +3,7 @@
 // Every body here is a `todo()`; the signatures are the design.
 //
 // `WsTransport[e]` IS THE HOOK.  "TLS via a hook" could have meant a
-// boolean on an options struct, or a `?TlsConfig` field, and both would
+// boolean on an options struct, or a `?WsTlsConfig` field, and both would
 // have been wrong in the same way: they name the two transports this
 // package happens to know about and refuse every other one.  A trait
 // names none of them.  `wss://` is `WsTls`, `ws://` is `WsTcp`, and a
@@ -54,6 +54,31 @@ pub struct WsTcp
 pub struct WsTls
     conn: Int
     hostname: Str
+
+// The TLS options `dial_tls` opens a connection with.
+//
+// THE PACKAGE DECLARES IT rather than naming a standard library type.
+// `compiler/stdlib/tls.nv` holds a struct of this shape, but it is not
+// a published surface: there is no `docs/stdlib/tls.md`, no `use`
+// brings the module into scope, and a signature naming its type
+// type-checked only while the undefined-type check did not exist.  It
+// does now, and it is `E2033`.
+//
+// AND THE NAME IS PREFIXED because struct identity is keyed by NAME
+// across a whole assembly, dependencies included: two packages that
+// each declared a bare `TlsConfig` could not be used by the same
+// program.  docs/publishing.md, "Public type names are globally
+// unique".
+//
+// `hostname` is both the SNI sent and the name the peer's certificate
+// is matched against — one field, because a program that could set
+// them apart would have a way to verify the wrong name.  An empty
+// `ca_bundle_path` means the platform's trust store; a caller pinning
+// its own roots gives the path to a PEM bundle.
+pub struct WsTlsConfig
+    hostname: Str
+    verify_peer: Bool
+    ca_bundle_path: Str
 
 // A listening socket, for the server half.
 pub struct WsListener
@@ -122,7 +147,7 @@ pub fn dial_tcp(host: Str, port: Int) -> Result<WsTcp, IoError> [io, net]
 // fn main() [io]
 //     println("${wstrans.WSS_PORT}")
 // ```
-pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<WsTls, IoError> [net]
+pub fn dial_tls(host: Str, port: Int, cfg: WsTlsConfig) -> Result<WsTls, IoError> [net]
     todo("websocket-nv.wstrans.dial_tls")
 
 // A client-side TLS configuration for a hostname, with peer
@@ -135,7 +160,7 @@ pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<WsTls, IoError> 
 //     let cfg = wstrans.tls_for("example.com")
 //     println("${wstrans.WSS_PORT}")
 // ```
-pub fn tls_for(hostname: Str) -> TlsConfig []
+pub fn tls_for(hostname: Str) -> WsTlsConfig []
     todo("websocket-nv.wstrans.tls_for")
 
 // Listen for connections on a port.
