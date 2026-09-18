@@ -1,6 +1,6 @@
 [package]
 name        = "websocket-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The socket half of WebSocket, over websocket-codec-nv: the RFC 6455 upgrade handshake on both sides over http-codec-nv, a connection value with typed send and receive, reassembly limits, automatic ping answering, the close handshake with its two deadlines, permessage-deflate over flate-nv, and the accept-loop shape a server takes.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -33,7 +33,12 @@ category    = "networking"
 tags        = ["websocket", "rfc6455", "client", "server", "upgrade", "permessage-deflate", "tls"]
 repository  = "https://github.com/novolang/websocket-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+# `>= 0.9.1` and not `>= 0.8.9`: `wstrans` names `TlsConfig`, the
+# standard library's record, which no toolchain before 0.9.1 has a
+# reachable module for.  `std.tls` existed in 0.9.0 and could not be
+# named — no `use` resolved it — which is the whole reason 0.0.2
+# carried a `WsTlsConfig` of its own.
+novo        = ">= 0.9.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

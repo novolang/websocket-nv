@@ -160,7 +160,7 @@ implementation will have to satisfy.
 | Module | Contents |
 | --- | --- |
 | `wsconn` | The connection value, its five states, the options, the six events a turn can produce, and `pump`, which performs one turn. |
-| `wstrans` | The transport. A trait any byte pipe can implement, a TCP implementation, a TLS implementation with its options record, a listener, and the address a `ws://` or `wss://` URL names. |
+| `wstrans` | The transport. A trait any byte pipe can implement, a TCP implementation, a TLS implementation dialled with the standard library's `TlsConfig`, a listener, and the address a `ws://` or `wss://` URL names. |
 | `wsclient` | The client side of the upgrade: the request a client offers, the random nonce and mask keys, and the check the server's answer has to pass. |
 | `wsserve` | The server side of the upgrade: what a server is willing to accept, the decision as a value, and the HTTP response a refusal gets. |
 | `wsdeflate` | permessage-deflate. The offer, the answer, the parameters, the four bytes RFC 7692 removes and appends, and whether a message is worth compressing. |
@@ -315,10 +315,10 @@ whatever that transport costs.
 - `std.net` in the standard library is what `WsTcp` is built on, and
   what it declares is what that transport costs. `WsTls` is written
   against a TLS connection handle, and the options beside it are
-  `wstrans.WsTlsConfig` — this package's own record, because the
-  standard library's TLS surface is not published (there is no
-  `docs/stdlib/tls.md` and no module a `use` resolves), so no package
-  can name a type from it.
+  `std.tls`'s own `TlsConfig`, named bare after `use std.tls`. This
+  package declared a `WsTlsConfig` of its own in 0.0.2, when `std.tls`
+  had no page and no `use` that resolved; 0.0.3 drops it for the
+  standard library's record, which carries every field it had.
 - `std.ws` in the standard library is a different thing with the same
   name on the tin. It is a `WebSocket` handle and six methods that hand
   a `Str` or a `Bytes` to the runtime, where the framing happens outside
