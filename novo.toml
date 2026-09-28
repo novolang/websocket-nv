@@ -1,6 +1,6 @@
 [package]
 name        = "websocket-nv"
-version     = "0.0.3"
+version     = "0.0.4"
 description = "The socket half of WebSocket, over websocket-codec-nv: the RFC 6455 upgrade handshake on both sides over http-codec-nv, a connection value with typed send and receive, reassembly limits, automatic ping answering, the close handshake with its two deadlines, permessage-deflate over flate-nv, and the accept-loop shape a server takes.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -50,7 +50,7 @@ novo        = ">= 0.9.1"
 # The `core` half of the split: every frame this package puts on a wire
 # was built there and every frame it reads was decoded there.  Nothing
 # in this package does frame arithmetic.
-websocket-codec-nv = "^0.0.3"
+websocket-codec-nv = "^0.0.6"
 
 # The handshake IS an HTTP/1.1 exchange (RFC 6455 § 4), and this
 # package names `H1Request` and `H1Response` in its own signatures, so
@@ -61,7 +61,7 @@ websocket-codec-nv = "^0.0.3"
 # websocket-codec-nv 0.0.3 requires exactly 0.0.1; one version of a
 # package is built into a program, so a `^0.0.2` here is a closure that
 # does not resolve.  The line moves when the codec's does.
-http-codec-nv = "^0.0.1"
+http-codec-nv = "^0.1.0"
 
 # permessage-deflate (RFC 7692).  The negotiation, the sliding-window
 # parameters and the trailing four bytes every compressed message drops
