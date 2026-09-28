@@ -40,7 +40,7 @@ impl WsTransport[] for WsScript
 
     fn ws_recv(self, max: Int) -> Result<Bytes, IoError>
         if self.open
-            Ok(self.incoming)
+            Ok(bytes.clone(self.incoming))
         else
             Ok(bytes.from_str(""))
 
