@@ -35,6 +35,10 @@
 // `Sec-WebSocket-Version` header is what a version mismatch gets.
 
 // What a server decides about an upgrade request.
+use wsconn
+use wsconnerr
+use wsdeflate
+
 pub enum WsUpgradeOutcome
     // Accept it: write this response, then the connection is a
     // WebSocket.  The response is `H1Response` rather than bytes so a

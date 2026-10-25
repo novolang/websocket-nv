@@ -48,6 +48,9 @@
 // one.
 
 // Where a connection is.
+use wsconnerr
+use wsdeflate
+
 pub enum WsConnState
     // Both directions carry data.
     WsOpen

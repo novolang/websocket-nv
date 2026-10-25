@@ -20,6 +20,7 @@ use wsconn
 use wsclient
 use wsconnerr
 use wstrans
+use wsdeflate
 
 // A transport over a script of bytes.  It performs nothing.
 struct WsScript

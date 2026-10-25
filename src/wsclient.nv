@@ -27,6 +27,11 @@
 // rather than accepting it.
 
 // What a client offers in the handshake beyond the URL.
+use wsconn
+use wsconnerr
+use wsdeflate
+use wstrans
+
 pub struct WsClientRequest
     // The address, from `wstrans.address_of`.
     address: WsAddress
