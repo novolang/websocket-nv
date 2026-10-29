@@ -14,12 +14,6 @@ the handshake is spelled in
 types, and the compression itself is
 [flate-nv](https://novo-lang.org/packages/flate-nv)'s.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What a WebSocket connection is
 
 A connection begins as an HTTP/1.1 request that asks to change protocol.
@@ -95,6 +89,13 @@ to nothing everywhere else.
 | `server_no_context_takeover`, `client_no_context_takeover` | on or off | Whether that window is dropped after every message |
 | The removed tail | 4 bytes | `00 00 FF FF`, removed by the sender and appended by the receiver |
 
+A message this package sends is compressed on its own, with an empty
+window, whatever was negotiated, and only when it is 128 bytes or longer.
+A message it receives is inflated through the peer's window, which is
+carried from one message to the next unless the peer declared
+`no_context_takeover` for its direction. RFC 7692 section 6.1 puts RSV1
+on the first frame of a message only, and on no control frame.
+
 ## Install
 
 ```
@@ -150,10 +151,7 @@ fn report(ev: WsConnEvent) [io]
         WsCloseCompleted      => println("both closes have gone")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented:
-websocket-nv.<module>.<fn>` panic. The tests are the specification the
-implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -264,6 +262,22 @@ whatever that transport costs.
 14. **The `Origin` is handed over and not judged.** `wsserve.origin_of`
     returns it. A browser sends one and other clients need not, so the
     policy belongs to the application.
+15. **A fault arrives after the events that came before it.** When one
+    read holds a message and then a frame that breaks the protocol, the
+    turn reports the message and the next `pump` returns the error. The
+    close frame the fault owes the peer has already gone out.
+16. **A client masks every frame and a server none** (section 5.3). The
+    four-byte keys come from a seed the handshake draws from the
+    system's entropy, so sending needs no `[rand]` row. A connection
+    built by hand with `wsconn.connection` has a fixed seed, which is
+    for tests.
+17. **A received text message is checked as UTF-8 when it is whole**
+    (section 8.1), after it has been inflated if it was compressed. With
+    `max_message` set to 0 the caller is streaming, receives each
+    fragment as it arrives, and checks the text itself.
+18. **`send_fragment` streams a binary message.** The first fragment
+    opens it, each later one continues it, and the one sent with `fin`
+    true ends it. It sends no compressed fragment.
 
 ## What is not included
 
@@ -277,10 +291,13 @@ whatever that transport costs.
   supplies, and `wsserve.origin_of` hands the header over. A library
   that decided either would be deciding for every application built on
   it.
-- **Frame arithmetic.** Nothing here encodes or decodes a frame. Every
-  frame this package sends was built by
+- **Frame encoding and decoding.** Every frame this package sends was
+  built and encoded by
   [websocket-codec-nv](https://novo-lang.org/packages/websocket-codec-nv),
-  and every frame it reads was decoded there.
+  and every frame it reads was decoded there. On a connection that
+  negotiated permessage-deflate this package cuts the stream into frames
+  and clears RSV1 on the first frame of a compressed message, because the
+  codec refuses a set reserved bit. It touches nothing else in a frame.
 - **Extensions other than permessage-deflate.** No other extension is
   offered, and an extension in a server's answer that the client did not
   offer is a failed handshake.
@@ -315,10 +332,7 @@ whatever that transport costs.
 - `std.net` in the standard library is what `WsTcp` is built on, and
   what it declares is what that transport costs. `WsTls` is written
   against a TLS connection handle, and the options beside it are
-  `std.tls`'s own `TlsConfig`, named bare after `use std.tls`. This
-  package declared a `WsTlsConfig` of its own in 0.0.2, when `std.tls`
-  had no page and no `use` that resolved; 0.0.3 drops it for the
-  standard library's record, which carries every field it had.
+  `std.tls`'s own `TlsConfig`, named bare after `use std.tls`.
 - `std.ws` in the standard library is a different thing with the same
   name on the tin. It is a `WebSocket` handle and six methods that hand
   a `Str` or a `Bytes` to the runtime, where the framing happens outside
@@ -331,63 +345,28 @@ whatever that transport costs.
 ## Tests
 
 ```bash
-novo test tests/wsconn_tests.nv     # the connection and the close handshake
-novo test tests/wshake_tests.nv     # the upgrade, and permessage-deflate
-novo test tests/wsserve_tests.nv    # the server's decision, and the client's checks
+novo test                          # every suite below
+bash tests/coverage.sh             # line coverage of src/
+bash tests/tls_loopback.sh         # WsTls against a TLS peer, needs openssl and python3
+bash tests/interop.sh              # Node's client and a Python server, needs node and python3
+python3 tests/vectors.py           # regenerate the compressed vectors
 ```
 
-The handshake vector is RFC 6455 section 1.3's own: the example nonce,
-the key it produces and the accept value that answers it. The window
-bounds and the four-byte tail are RFC 7692 section 7.1.2 and section
-7.2.1. The Autobahn Testsuite is the oracle the finished implementation
-will be measured against, and its cases are writable as tables here
-because a transport that hands back bytes from memory is a transport
-like any other.
-
-The suite checks that a fresh connection is open in both directions,
-that an endpoint which has sent a close may still receive, that a second
-close is refused rather than sent, that the two deadlines are separate
-numbers, that the three unsendable close codes are never owed to a peer,
-that a wrong version is refused with the header the RFC requires, that
-an `Origin` is handed over and not judged, that a server may narrow a
-compression window and may not widen one, and that a client refuses an
-answer it did not offer.
-
-The tests compile today and fail at run, each on the `not implemented:
-websocket-nv.<module>.<fn>` panic that is its body. That is the expected
-state of an interface release. They turn green one at a time as bodies
-land.
-
-## Implementation status
-
-Every type, every enum variant and every declared effect is published
-in full.
-This table is about the function bodies.
-
-| Item | Implemented |
+| Suite | What it holds |
 | --- | --- |
-| `wstrans.WS_PORT`, `.WSS_PORT` | yes (they are constants) |
-| `wsdeflate.WS_DEFLATE_MIN_WINDOW_BITS`, `.WS_DEFLATE_MAX_WINDOW_BITS`, `.WS_DEFLATE_TAIL_LEN`, `.WS_PERMESSAGE_DEFLATE` | yes (they are constants) |
-| `wstrans.address_of`, `.dial_tcp`, `.dial_tls`, `.tls_for` | no |
-| `wstrans.listen`, `.accept`, `.stream_of` | no |
-| `wstrans`: the `WsTransport` implementations for `WsTcp` and `WsTls` | no |
-| `wsconn.default_options`, `.quiet_options`, `.connection` | no |
-| `wsconn.state_of`, `.can_send`, `.can_receive`, `.now_ms` | no |
-| `wsconn.pump`, `.send_text`, `.send_binary`, `.send_fragment`, `.send_ping`, `.close` | no |
-| `wsconn.peer_close`, `.local_close`, `.subprotocol_of`, `.deflate_of` | no |
-| `wsconn.wait_ms`, `.close_expired`, `.pong_expired`, `.ping_due` | no |
-| `wsclient.request`, `.with_protocols`, `.with_headers`, `.with_deflate` | no |
-| `wsclient.nonce`, `.mask_keys` | no |
-| `wsclient.handshake`, `.handshake_with_nonce`, `.request_bytes` | no |
-| `wsclient.accept_response`, `.connect` | no |
-| `wsserve.policy`, `.with_protocols`, `.with_deflate`, `.with_options` | no |
-| `wsserve.is_upgrade`, `.upgrade`, `.choose_protocol`, `.origin_of` | no |
-| `wsserve.refusal_response`, `.response_bytes`, `.accept_upgrade` | no |
-| `wsdeflate.default_params`, `.offer_header`, `.answer_header`, `.extensions_header` | no |
-| `wsdeflate.accept_offer`, `.check_answer` | no |
-| `wsdeflate.compress`, `.decompress` | no |
-| `wsdeflate.send_window_bits`, `.resets_context`, `.worth_compressing` | no |
-| `wsconnerr.close_code_for`, `.is_reconnectable`, `.http_status_for`, and the `message` implementation | no |
+| `tests/wsproto_tests.nv` | The Autobahn Testsuite's conversations for framing, pings, reserved bits, opcodes, fragmentation, UTF-8, closing and limits, as tables of bytes |
+| `tests/wsflow_tests.nv` | Sending and masking, the close handshake begun here, the timers, the handshake on both sides over a transport and over a loopback socket, and the fault messages |
+| `tests/wscompress_tests.nv` | A connection that negotiated permessage-deflate, against streams written by CPython's zlib |
+| `tests/wsdeflate_tests.nv` | The negotiation table and the compressed payloads, against RFC 7692 section 7.2.3 and zlib |
+| `tests/wsconn_tests.nv`, `tests/wshake_tests.nv`, `tests/wsserve_tests.nv` | The connection value, the upgrade and the server's decision |
+
+The handshake vector is RFC 6455 section 1.3's own: the example nonce,
+the key it produces and the accept value that answers it. The first frame
+examples are RFC 6455 section 5.7's. The compressed bytes for `Hello` and
+for the empty message are the ones RFC 7692 section 7.2.3 prints, and
+every other compressed stream is inflated by zlib or written by it. The
+frames a test sends are built, and the frames a connection sends are read
+back, by code that shares nothing with websocket-codec-nv.
 
 ## Licence
 
