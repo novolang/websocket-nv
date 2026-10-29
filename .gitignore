@@ -18,3 +18,6 @@ APIDOC.md
 # own — so committing it costs nobody anything and makes this
 # repository's CI reproducible.  It is not on the publish allow-list, so
 # it never ships either way.
+/tls_probe
+/interop_server
+/interop_probe

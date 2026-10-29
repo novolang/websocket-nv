@@ -1,33 +1,31 @@
-// wsdeflate.nv — permessage-deflate (RFC 7692), which is a negotiation
-// and four bytes.
+// wsdeflate.nv — permessage-deflate (RFC 7692): the negotiation, and the
+// four bytes every compressed message drops.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Nothing here performs input or output, so every function declares no
+// effect. The negotiation is string handling over a header, the
+// parameters are integers, and the compression itself is flate-nv's, in
+// raw mode. A program can therefore ask what a given
+// `Sec-WebSocket-Extensions` header negotiates to without a socket.
 //
-// NOTHING HERE PERFORMS ANYTHING — every row is `[]`.  The negotiation
-// is string handling over a header, the parameters are integers, and
-// the compression itself is flate-nv's, in raw mode.  A caller can
-// therefore assert what a given `Sec-WebSocket-Extensions` header
-// negotiates to without a socket, which matters because the
-// negotiation is the part implementations disagree about.
+// RFC 7692 section 7.2.1 says a sender compresses the message and then
+// removes the trailing `00 00 FF FF` before it goes into the frame. A
+// receiver appends those four bytes before inflating (section 7.2.2).
+// They are DEFLATE's empty stored block, written by a sync flush, and
+// dropping them lets one DEFLATE stream span many messages.
 //
-// THE FOUR BYTES ARE THE WHOLE TRICK, AND THEY ARE WHY THIS IS NOT
-// JUST "DEFLATE THE PAYLOAD".  RFC 7692 § 7.2.1 says a sender
-// compresses the message, then REMOVES the trailing `00 00 FF FF`
-// before putting it in the frame; a receiver appends those same four
-// bytes before inflating.  They are DEFLATE's empty-stored-block
-// marker, and dropping them is what lets one DEFLATE stream span many
-// messages without each one paying for a flush.  An implementation
-// that forgets either half produces frames that decompress to nothing
-// on every other implementation, and the failure looks like corruption
-// rather than like a missing four bytes.
+// `no_context_takeover` is a memory setting. Without it each side keeps a
+// 32 KiB sliding window for the life of the connection, in each
+// direction. The default parameters ask for it on both sides.
 //
-// AND `no_context_takeover` IS A MEMORY DECISION, NOT A SPEED ONE.
-// Without it, each side keeps a 32 KiB sliding window per connection
-// for the life of the connection — which on a server with ten thousand
-// connections is 640 MB of window it did not ask for.  A server that
-// negotiated permessage-deflate without asking for
-// `server_no_context_takeover` has agreed to that; the default here
-// asks for it, and the README says so.
+// A message this package sends is compressed on its own, with an empty
+// window, which every peer accepts whatever it negotiated. A message it
+// receives is inflated with the window carried over from the previous
+// one unless the peer declared `no_context_takeover` for its direction.
+
+use std.bytes
+use deflate
+use flate
+use inflate
 
 // What one side offered or accepted.
 pub struct WsDeflateParams
@@ -63,6 +61,125 @@ pub const WS_DEFLATE_TAIL_LEN = 4
 // The extension's name as it appears in the header.
 pub const WS_PERMESSAGE_DEFLATE = "permessage-deflate"
 
+// One element of an extensions header, read.
+//
+// `named` is true when the element names permessage-deflate. `valid` is
+// false when a parameter is not one RFC 7692 section 7.1 defines, is
+// given twice, or carries a value outside its range. A window-bits
+// parameter with no value is `has_*_bits` with `*_bare` set.
+struct Element
+    var named: Bool
+    var valid: Bool
+    var server_no_context_takeover: Bool
+    var client_no_context_takeover: Bool
+    var has_server_bits: Bool
+    var server_bits: Int
+    var has_client_bits: Bool
+    var client_bits: Int
+    var client_bare: Bool
+
+fn blank_element() -> Element
+    Element { named: false, valid: true,
+              server_no_context_takeover: false, client_no_context_takeover: false,
+              has_server_bits: false, server_bits: 0,
+              has_client_bits: false, client_bits: 0, client_bare: false }
+
+// A window-bits value: a decimal number from 8 to 15, which RFC 7692
+// section 7.1.2 allows to arrive as a quoted string.
+fn window_bits_of(raw: Str) -> ?Int
+    var text = str.trim(raw)
+    if str.len(text) >= 2 and str.starts_with(text, "\"") and str.ends_with(text, "\"")
+        text = str.slice(text, 1, str.len(text) - 1)
+    match str.to_int(text)
+        None    => None
+        Some(n) =>
+            if n < WS_DEFLATE_MIN_WINDOW_BITS or n > WS_DEFLATE_MAX_WINDOW_BITS
+                None
+            else
+                Some(n)
+
+// The element with one more parameter read into it.
+fn with_param(e: Element, raw: Str) -> Element
+    var out = e
+    var name = raw
+    var value = ""
+    var has_value = false
+    match str.index(raw, "=")
+        None     => ()
+        Some(at) =>
+            name = str.trim(str.slice(raw, 0, at))
+            value = str.slice(raw, at + 1, str.len(raw))
+            has_value = true
+    if name == "server_no_context_takeover"
+        if has_value or out.server_no_context_takeover
+            out.valid = false
+        out.server_no_context_takeover = true
+    else if name == "client_no_context_takeover"
+        if has_value or out.client_no_context_takeover
+            out.valid = false
+        out.client_no_context_takeover = true
+    else if name == "server_max_window_bits"
+        if out.has_server_bits or not has_value
+            out.valid = false
+        match window_bits_of(value)
+            None    =>
+                out.valid = false
+            Some(n) =>
+                out.server_bits = n
+        out.has_server_bits = true
+    else if name == "client_max_window_bits"
+        if out.has_client_bits
+            out.valid = false
+        out.has_client_bits = true
+        if has_value
+            match window_bits_of(value)
+                None    =>
+                    out.valid = false
+                Some(n) =>
+                    out.client_bits = n
+        else
+            out.client_bare = true
+            out.client_bits = WS_DEFLATE_MAX_WINDOW_BITS
+    else
+        out.valid = false
+    out
+
+fn parse_element(text: Str) -> Element
+    let parts = str.split(text, ";")
+    var e = blank_element()
+    if str.trim(parts[0]) != WS_PERMESSAGE_DEFLATE
+        return e
+    e.named = true
+    for raw in parts[1:list.len(parts)]
+        e = with_param(e, str.trim(raw))
+    e
+
+fn framed(chunk: Bytes, last: Bool) -> Bytes
+    if last
+        bytes.concat([chunk, tail_bytes()])
+    else
+        bytes.clone(chunk)
+
+fn smaller(a: Int, b: Int) -> Int
+    if a < b
+        a
+    else
+        b
+
+// The bytes DEFLATE writes for an empty stored block, which a sync
+// flush ends with and RFC 7692 section 7.2.1 removes.
+fn tail_bytes() -> Bytes
+    bytes.from_byte_list([0, 0, 255, 255])
+
+// One piece of a message, compressed on its own and ended with a sync
+// flush. An encoder with an empty window cannot reach back past the
+// piece, which is what keeps a short window honest.
+fn compress_piece(piece: Bytes) -> Bytes
+    let started = deflate.deflater(RawDeflate, flate.balanced())
+    let (pushed, head) = deflate.push(started, piece)
+    let (_, rest) = deflate.flush(pushed)
+    bytes.concat([head, rest])
+
 // The parameters a client offers by default: both sides asked to drop
 // their context, and the largest window on both.
 //
@@ -79,7 +196,9 @@ pub const WS_PERMESSAGE_DEFLATE = "permessage-deflate"
 //     println("${wsdeflate.default_params().server_max_window_bits}")
 // ```
 pub fn default_params() -> WsDeflateParams []
-    todo("websocket-nv.wsdeflate.default_params")
+    WsDeflateParams { server_no_context_takeover: true, client_no_context_takeover: true,
+                      server_max_window_bits: WS_DEFLATE_MAX_WINDOW_BITS,
+                      client_max_window_bits: WS_DEFLATE_MAX_WINDOW_BITS }
 
 // The `Sec-WebSocket-Extensions` value a client offers for these
 // parameters.
@@ -91,7 +210,18 @@ pub fn default_params() -> WsDeflateParams []
 //     println(wsdeflate.offer_header(wsdeflate.default_params()))
 // ```
 pub fn offer_header(p: WsDeflateParams) -> Str []
-    todo("websocket-nv.wsdeflate.offer_header")
+    var out = WS_PERMESSAGE_DEFLATE
+    if p.server_no_context_takeover
+        out = out + "; server_no_context_takeover"
+    if p.client_no_context_takeover
+        out = out + "; client_no_context_takeover"
+    if p.server_max_window_bits < WS_DEFLATE_MAX_WINDOW_BITS
+        out = out + "; server_max_window_bits=${p.server_max_window_bits}"
+    if p.client_max_window_bits < WS_DEFLATE_MAX_WINDOW_BITS
+        out = out + "; client_max_window_bits=${p.client_max_window_bits}"
+    else
+        out = out + "; client_max_window_bits"
+    out
 
 // What a server accepts from a client's offer, given its own limits,
 // or `WsDeflateOff` if it declines.
@@ -112,7 +242,23 @@ pub fn offer_header(p: WsDeflateParams) -> Str []
 //         WsDeflateOff   => println("declined")
 // ```
 pub fn accept_offer(offered: Str, limits: WsDeflateParams) -> WsDeflateState []
-    todo("websocket-nv.wsdeflate.accept_offer")
+    for text in str.split(offered, ",")
+        let e = parse_element(text)
+        if e.named and e.valid
+            var server_bits = WS_DEFLATE_MAX_WINDOW_BITS
+            if e.has_server_bits
+                server_bits = smaller(e.server_bits, limits.server_max_window_bits)
+            var client_bits = WS_DEFLATE_MAX_WINDOW_BITS
+            if e.has_client_bits
+                client_bits = smaller(e.client_bits, limits.client_max_window_bits)
+            return WsDeflateOn(WsDeflateParams {
+                server_no_context_takeover: e.server_no_context_takeover
+                                            or limits.server_no_context_takeover,
+                client_no_context_takeover: e.client_no_context_takeover
+                                            or limits.client_no_context_takeover,
+                server_max_window_bits: server_bits,
+                client_max_window_bits: client_bits })
+    WsDeflateOff
 
 // What a client makes of the server's answer: the negotiated state, or
 // why the answer was not acceptable.
@@ -132,7 +278,34 @@ pub fn accept_offer(offered: Str, limits: WsDeflateParams) -> WsDeflateState []
 // ```
 pub fn check_answer(answered: Str,
                     offered: WsDeflateParams) -> Result<WsDeflateState, WsHandshakeError> []
-    todo("websocket-nv.wsdeflate.check_answer")
+    let trimmed = str.trim(answered)
+    if trimmed == ""
+        return Ok(WsDeflateOff)
+    if str.contains(trimmed, ",")
+        return Err(UnrequestedExtension(trimmed))
+    let e = parse_element(trimmed)
+    if not e.named or not e.valid
+        return Err(UnrequestedExtension(trimmed))
+    // The server may narrow a window the client offered. It may not
+    // widen one, and it may not name one the client did not offer.
+    var server_bits = offered.server_max_window_bits
+    if e.has_server_bits
+        if offered.server_max_window_bits >= WS_DEFLATE_MAX_WINDOW_BITS
+            return Err(UnrequestedExtension(trimmed))
+        if e.server_bits > offered.server_max_window_bits
+            return Err(UnrequestedExtension(trimmed))
+        server_bits = e.server_bits
+    var client_bits = offered.client_max_window_bits
+    if e.has_client_bits
+        if e.client_bits > offered.client_max_window_bits
+            return Err(UnrequestedExtension(trimmed))
+        client_bits = e.client_bits
+    Ok(WsDeflateOn(WsDeflateParams {
+        server_no_context_takeover: e.server_no_context_takeover,
+        client_no_context_takeover: e.client_no_context_takeover
+                                    or offered.client_no_context_takeover,
+        server_max_window_bits: server_bits,
+        client_max_window_bits: client_bits }))
 
 // The `Sec-WebSocket-Extensions` value a server answers with.
 //
@@ -143,7 +316,16 @@ pub fn check_answer(answered: Str,
 //     println(wsdeflate.answer_header(wsdeflate.default_params()))
 // ```
 pub fn answer_header(p: WsDeflateParams) -> Str []
-    todo("websocket-nv.wsdeflate.answer_header")
+    var out = WS_PERMESSAGE_DEFLATE
+    if p.server_no_context_takeover
+        out = out + "; server_no_context_takeover"
+    if p.client_no_context_takeover
+        out = out + "; client_no_context_takeover"
+    if p.server_max_window_bits < WS_DEFLATE_MAX_WINDOW_BITS
+        out = out + "; server_max_window_bits=${p.server_max_window_bits}"
+    if p.client_max_window_bits < WS_DEFLATE_MAX_WINDOW_BITS
+        out = out + "; client_max_window_bits=${p.client_max_window_bits}"
+    out
 
 // The header name both sides use.
 //
@@ -154,7 +336,52 @@ pub fn answer_header(p: WsDeflateParams) -> Str []
 //     println(wsdeflate.extensions_header())
 // ```
 pub fn extensions_header() -> Str []
-    todo("websocket-nv.wsdeflate.extensions_header")
+    "Sec-WebSocket-Extensions"
+
+// A decoder for a peer's messages, empty and ready for the first one.
+//
+// ```novo
+// use wsdeflate
+//
+// fn main() [io]
+//     println("${wsdeflate.new_inflater()}")
+// ```
+pub fn new_inflater() -> Inflater
+    inflate.inflater(RawDeflate)
+
+// One message, or one fragment of it, run through a peer's decoder.
+//
+// `last` is true for the fragment that ends the message, and only then are
+// the four bytes appended. `budget` bounds the plaintext this call may
+// produce; zero means no bound. The answer is the decoder to use next and
+// the plaintext. A decoder that carries its window from one message to the
+// next is how a peer that did not declare `no_context_takeover` is read.
+//
+// ```novo
+// use wsdeflate
+// use std.bytes
+//
+// fn main() [io]
+//     let d = wsdeflate.new_inflater()
+//     match wsdeflate.inflate_step(d, bytes.from_str(""), true, 0)
+//         Ok(_)  => println("inflated")
+//         Err(_) => println("refused")
+// ```
+pub fn inflate_step(d: Inflater, chunk: Bytes, last: Bool,
+                    budget: Int) -> Result<(Inflater, Bytes), FlateError> []
+    var cur = d
+    if budget > 0
+        cur = inflate.with_limit(cur, inflate.total_out(cur) + budget)
+    let (next, plain) = inflate.feed(cur, framed(chunk, last))
+    match inflate.error(next)
+        Some(e) => Err(e)
+        None    =>
+            if inflate.is_done(next)
+                // The peer ended its stream. The next message starts a
+                // new one, with no window.
+                Ok((new_inflater(), plain))
+            else
+                Ok((next, plain))
 
 // A message's payload, compressed and with the trailing four bytes
 // already removed — ready to be a frame with RSV1 set.
@@ -173,7 +400,22 @@ pub fn extensions_header() -> Str []
 //         Err(_) => println("refused")
 // ```
 pub fn compress(payload: Bytes, p: WsDeflateParams, is_client: Bool) -> Result<Bytes, FlateError> []
-    todo("websocket-nv.wsdeflate.compress")
+    let window = send_window_bits(p, is_client)
+    var out: [Bytes] = []
+    let n = bytes.len(payload)
+    if window >= WS_DEFLATE_MAX_WINDOW_BITS or n == 0
+        out = [compress_piece(payload)]
+    else
+        // A window shorter than DEFLATE's own: each piece is no longer
+        // than the window, so no match reaches past it.
+        let size = 1 << window
+        var at = 0
+        while at < n
+            let hi = smaller(at + size, n)
+            list.push(out, compress_piece(bytes.slice(payload, at, hi)))
+            at = hi
+    let whole = bytes.concat(out)
+    Ok(bytes.slice(whole, 0, bytes.len(whole) - WS_DEFLATE_TAIL_LEN))
 
 // A compressed payload inflated, with the trailing four bytes appended
 // first.
@@ -190,7 +432,17 @@ pub fn compress(payload: Bytes, p: WsDeflateParams, is_client: Bool) -> Result<B
 // ```
 pub fn decompress(payload: Bytes, p: WsDeflateParams, is_client: Bool,
                   max_out: Int) -> Result<Bytes, FlateError> []
-    todo("websocket-nv.wsdeflate.decompress")
+    // The payload is closed with an empty final block after the four
+    // bytes, so a payload that stops inside a block is refused instead of
+    // read as far as it goes.
+    var d = inflate.inflater(RawDeflate)
+    if max_out > 0
+        d = inflate.with_limit(d, max_out)
+    let closed = bytes.concat([payload, tail_bytes(), bytes.from_byte_list([1, 0, 0, 255, 255])])
+    let (next, plain) = inflate.feed(d, closed)
+    match inflate.finish(next)
+        Err(e) => Err(e)
+        Ok(_)  => Ok(plain)
 
 // The window bits this side must use for its OWN sends, given the
 // negotiated parameters and which side it is.
@@ -208,7 +460,10 @@ pub fn decompress(payload: Bytes, p: WsDeflateParams, is_client: Bool,
 //     println("${wsdeflate.send_window_bits(wsdeflate.default_params(), true)}")
 // ```
 pub fn send_window_bits(p: WsDeflateParams, is_client: Bool) -> Int []
-    todo("websocket-nv.wsdeflate.send_window_bits")
+    if is_client
+        p.client_max_window_bits
+    else
+        p.server_max_window_bits
 
 // Whether this side must reset its compression context after every
 // message, given the negotiated parameters and its role.
@@ -220,7 +475,10 @@ pub fn send_window_bits(p: WsDeflateParams, is_client: Bool) -> Int []
 //     println("${wsdeflate.resets_context(wsdeflate.default_params(), true)}")
 // ```
 pub fn resets_context(p: WsDeflateParams, is_client: Bool) -> Bool []
-    todo("websocket-nv.wsdeflate.resets_context")
+    if is_client
+        p.client_no_context_takeover
+    else
+        p.server_no_context_takeover
 
 // True when a message this size is worth compressing at all.
 //
@@ -235,4 +493,4 @@ pub fn resets_context(p: WsDeflateParams, is_client: Bool) -> Bool []
 //     println("${wsdeflate.worth_compressing(4)}")
 // ```
 pub fn worth_compressing(payload_len: Int) -> Bool []
-    todo("websocket-nv.wsdeflate.worth_compressing")
+    payload_len >= 128

@@ -1,28 +1,20 @@
-// wstrans.nv — the TLS hook, spelled as a trait.
+// wstrans.nv — the transports a connection runs over, and the trait that
+// lets a program supply its own.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `WsTransport[e]` is the hook. `wss://` is `WsTls`, `ws://` is `WsTcp`,
+// and a program that terminates TLS at a load balancer, speaks WebSocket
+// over a unix socket, or replays a recorded conversation in a test
+// supplies its own and pays for nothing it does not use.
 //
-// `WsTransport[e]` IS THE HOOK.  "TLS via a hook" could have meant a
-// boolean on an options struct, or a `?TlsConfig` field, and both would
-// have been wrong in the same way: they name the two transports this
-// package happens to know about and refuse every other one.  A trait
-// names none of them.  `wss://` is `WsTls`, `ws://` is `WsTcp`, and a
-// program terminating TLS at a load balancer, speaking WebSocket over
-// a unix socket to a sidecar, or replaying a recorded conversation in
-// a test supplies its own and pays for nothing it does not use.
-//
-// AND IT IS WHAT MAKES THE AUTOBAHN CASES WRITABLE.  The Autobahn
-// Testsuite is 500-odd conversations, most of them about exactly when
-// a frame arrives relative to another one.  Over a socket those are
-// integration tests with timing in them; over a transport that hands
-// back bytes from memory they are tables.  websocket-codec-nv made the
-// framing testable that way and this is the same move one layer up.
-//
-// A TRANSPORT DOES NOT FRAME.  It moves bytes.  A `ws_recv` that
-// returned "one frame" would be a second decoder beside
-// websocket-codec-nv's, and two decoders eventually disagree.
+// A transport moves bytes and does not frame them. A `ws_recv` that
+// returned one frame would be a second decoder beside websocket-codec-nv's.
+// Over a transport that hands back bytes from memory, a conversation of any
+// timing is a table of bytes and a table of milliseconds.
 
 use std.tls
+use std.bytes
+use h1read
+use wsconnerr
 
 // A byte pipe a WebSocket connection can be driven over.
 //
@@ -33,16 +25,84 @@ pub trait WsTransport[e]
     // Hand the transport bytes.  The answer is how many it took; a
     // short write is not a failure, and the caller sends the rest.
     fn ws_send(self, data: Bytes) -> Result<Int, IoError> [e]
-    // Up to `max` bytes.  An EMPTY answer means the peer closed the
-    // TCP connection, which RFC 6455 § 7.1.5 makes a distinct outcome
-    // from a close FRAME: the first is 1006 and may never be sent, the
-    // second is whatever code the peer chose.
+    // Up to `max` bytes. `Err(IoClosed)` means the peer closed the TCP
+    // connection, which RFC 6455 section 7.1.5 makes a distinct outcome
+    // from a close frame: the first is 1006 and may never be sent, the
+    // second is whatever code the peer chose. `Err(IoTimedOut)` means
+    // nothing arrived before the transport's receive deadline, and the
+    // connection is still usable. An empty answer from a transport that
+    // reports itself closed is read as `Err(IoClosed)`.
     fn ws_recv(self, max: Int) -> Result<Bytes, IoError> [e]
     // Close it.  Calling this twice is not an error.
     fn ws_close(self) -> ?IoError [e]
     // Whether the transport believes it is open.  The one method with
     // no effect row, because a close handshake asks it on every turn.
     fn ws_is_open(self) -> Bool
+
+// The head of an HTTP message read off a transport, and the bytes that
+// followed it in the same reads. A server that sends frames right after
+// its 101 makes those bytes the start of the first turn.
+pub struct WsHead
+    event: H1Event
+    rest: [u8]
+
+// Everything in `data` handed to the transport, looping over short writes.
+//
+// ```novo ignore
+// use wstrans
+//
+// fn say(t: WsTcp, data: [u8]) -> ?IoError [io, net]
+//     wstrans.send_all(t, data)
+// ```
+pub fn send_all<T: WsTransport[e]>(t: T, data: [u8]) -> ?IoError [e]
+    let all = bytes.from_byte_list(data)
+    let n = bytes.len(all)
+    var sent = 0
+    while sent < n
+        match t.ws_send(bytes.slice(all, sent, n))
+            Err(err) =>
+                return Some(err)
+            Ok(k)    =>
+                if k <= 0
+                    return Some(IoBrokenPipe)
+                sent = sent + k
+    None
+
+// One more read toward a complete head: the bytes seen so far, plus what
+// the transport hands over now.
+fn read_more<T: WsTransport[e]>(t: T, role: H1Role, before: [u8]) -> Result<WsHead, WsConnError> [e]
+    match t.ws_recv(4096)
+        Err(err)  =>
+            Err(WsSocketFailed(err))
+        Ok(chunk) =>
+            if bytes.len(chunk) == 0
+                return Err(WsSocketFailed(IoClosed))
+            let seen = list.concat(before, bytes.to_byte_list(chunk))
+            match h1read.parse_head(seen, role, h1read.default_limits())
+                Err(err) =>
+                    Err(WsSocketFailed(IoInvalidInput(err.message())))
+                Ok(step) =>
+                    match step.event
+                        None     =>
+                            read_more(t, role, seen)
+                        Some(ev) =>
+                            let at = h1read.offset(step.reader)
+                            Ok(WsHead { event: ev, rest: seen[at:list.len(seen)] })
+
+// Read from the transport until the head of an HTTP message is complete.
+//
+// `ReadsResponses` reads a response head and `ReadsRequests` a request
+// head. A transport that closes first, or a head that is not HTTP, is an
+// error.
+//
+// ```novo ignore
+// use wstrans
+//
+// fn head(t: WsTcp) -> Result<WsHead, WsConnError> [io, net]
+//     wstrans.read_head(t, ReadsResponses)
+// ```
+pub fn read_head<T: WsTransport[e]>(t: T, role: H1Role) -> Result<WsHead, WsConnError> [e]
+    read_more(t, role, [])
 
 // WebSocket over a plain TCP socket — the `ws://` scheme.
 pub struct WsTcp
@@ -81,6 +141,68 @@ pub struct WsAddress
     // The request target: the path and query, `/` when there is none.
     target: Str
 
+// The port in an authority's text, or -1 when it is not one. An empty
+// text is the scheme's default, and 0 is not a port a socket connects to.
+fn port_of(text: Str, default_port: Int) -> Int
+    if text == ""
+        return default_port
+    match str.to_int(text)
+        None    => -1
+        Some(n) =>
+            if n < 1 or n > 65535
+                -1
+            else
+                n
+
+// The address once the scheme is off: host, optional port, then the
+// request target.
+fn address_after_scheme(rest: Str, secure: Bool) -> ?WsAddress
+    var default_port = WS_PORT
+    if secure
+        default_port = WSS_PORT
+    var body = rest
+    match str.index(body, "#")
+        None     => ()
+        Some(at) =>
+            body = str.slice(body, 0, at)
+    var authority = body
+    var target = "/"
+    match str.index(body, "/")
+        Some(at) =>
+            authority = str.slice(body, 0, at)
+            target = str.slice(body, at, str.len(body))
+        None     =>
+            match str.index(body, "?")
+                None     => ()
+                Some(at) =>
+                    authority = str.slice(body, 0, at)
+                    target = "/" + str.slice(body, at, str.len(body))
+    if str.contains(authority, "@")
+        return None
+    var host = authority
+    var port = default_port
+    if str.starts_with(authority, "[")
+        // A bracketed IPv6 literal: the host is what is inside.
+        match str.index(authority, "]")
+            None     =>
+                return None
+            Some(at) =>
+                host = str.slice(authority, 1, at)
+                let after = str.slice(authority, at + 1, str.len(authority))
+                if after != ""
+                    if not str.starts_with(after, ":")
+                        return None
+                    port = port_of(str.slice(after, 1, str.len(after)), default_port)
+    else
+        match str.index(authority, ":")
+            None     => ()
+            Some(at) =>
+                host = str.slice(authority, 0, at)
+                port = port_of(str.slice(authority, at + 1, str.len(authority)), default_port)
+    if host == "" or port < 0
+        return None
+    Some(WsAddress { secure: secure, host: host, port: port, target: target })
+
 // The address a `ws://` or `wss://` URL names.
 //
 // The default port comes from the scheme, which is the part a caller
@@ -97,7 +219,13 @@ pub struct WsAddress
 //         None    => println("not a websocket url")
 // ```
 pub fn address_of(url: Str) -> ?WsAddress []
-    todo("websocket-nv.wstrans.address_of")
+    let lowered = str.lower(url)
+    if str.starts_with(lowered, "wss://")
+        address_after_scheme(str.slice(url, 6, str.len(url)), true)
+    else if str.starts_with(lowered, "ws://")
+        address_after_scheme(str.slice(url, 5, str.len(url)), false)
+    else
+        None
 
 // Open a TCP connection.
 //
@@ -110,7 +238,9 @@ pub fn address_of(url: Str) -> ?WsAddress []
 //     println("${wstrans.WS_PORT}")
 // ```
 pub fn dial_tcp(host: Str, port: Int) -> Result<WsTcp, IoError> [io, net]
-    todo("websocket-nv.wstrans.dial_tcp")
+    match TcpStream.connect(host, port)
+        Some(stream) => Ok(WsTcp { stream: stream })
+        None         => Err(IoOther("could not connect to ${host}:${port}"))
 
 // Open a TLS connection.
 //
@@ -135,7 +265,10 @@ pub fn dial_tcp(host: Str, port: Int) -> Result<WsTcp, IoError> [io, net]
 //     println("${wstrans.WSS_PORT}")
 // ```
 pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<WsTls, IoError> [net]
-    todo("websocket-nv.wstrans.dial_tls")
+    match tls.connect(host, port, cfg)
+        // cov: skip — reached only with a TLS peer, which tests/tls_loopback.sh provides.
+        Some(conn) => Ok(WsTls { conn: conn, hostname: cfg.hostname })
+        None       => Err(IoOther("TLS to ${host}:${port} failed: ${tls.last_error()}"))
 
 // A client-side TLS configuration for a hostname, with peer
 // verification on.
@@ -154,7 +287,7 @@ pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<WsTls, IoError> 
 //     println("${wstrans.WSS_PORT}")
 // ```
 pub fn tls_for(hostname: Str) -> TlsConfig []
-    todo("websocket-nv.wstrans.tls_for")
+    tls.config_for_client(hostname)
 
 // Listen for connections on a port.
 //
@@ -165,7 +298,9 @@ pub fn tls_for(hostname: Str) -> TlsConfig []
 //     println("${wstrans.WS_PORT}")
 // ```
 pub fn listen(host: Str, port: Int) -> Result<WsListener, IoError> [io, net]
-    todo("websocket-nv.wstrans.listen")
+    match TcpListener.listen_on(host, port)
+        Some(listener) => Ok(WsListener { listener: listener })
+        None           => Err(IoOther("could not listen on ${host}:${port}"))
 
 // Take the next connection, with the peer's address beside it.
 //
@@ -176,7 +311,9 @@ pub fn listen(host: Str, port: Int) -> Result<WsListener, IoError> [io, net]
 //     wstrans.accept(l)
 // ```
 pub fn accept(l: WsListener) -> Result<WsAccepted, IoError> [io, net]
-    todo("websocket-nv.wstrans.accept")
+    match l.listener.accept()
+        Some(pair) => Ok(WsAccepted { transport: WsTcp { stream: pair.0 }, peer: pair.1 })
+        None       => Err(IoOther("accept failed"))
 
 // A connection that has been accepted and not yet upgraded.
 pub struct WsAccepted
@@ -193,7 +330,7 @@ pub struct WsAccepted
 //     println("${wstrans.WS_PORT}")
 // ```
 pub fn stream_of(t: WsTcp) -> TcpStream []
-    todo("websocket-nv.wstrans.stream_of")
+    t.stream
 
 // WebSocket over a TCP stream.
 //
@@ -208,16 +345,29 @@ pub fn stream_of(t: WsTcp) -> TcpStream []
 // ```
 impl WsTransport[io, net] for WsTcp
     fn ws_send(self, data: Bytes) -> Result<Int, IoError> [io, net]
-        todo("websocket-nv.wstrans.WsTcp.ws_send")
+        if self.stream.send_bytes(data)
+            Ok(bytes.len(data))
+        else
+            Err(IoBrokenPipe)
 
     fn ws_recv(self, max: Int) -> Result<Bytes, IoError> [io, net]
-        todo("websocket-nv.wstrans.WsTcp.ws_recv")
+        match self.stream.recv_bytes(max)
+            Some(chunk) => Ok(chunk)
+            None        =>
+                // The runtime answers None for a closed peer, a failure
+                // and a receive deadline alike. The deadline is the one
+                // that leaves the connection usable.
+                if net.recv_would_block()
+                    Err(IoTimedOut)
+                else
+                    Err(IoClosed)
 
     fn ws_close(self) -> ?IoError [io, net]
-        todo("websocket-nv.wstrans.WsTcp.ws_close")
+        self.stream.close()
+        None
 
     fn ws_is_open(self) -> Bool
-        todo("websocket-nv.wstrans.WsTcp.ws_is_open")
+        self.stream.is_open()
 
 // WebSocket over TLS.
 //
@@ -230,15 +380,27 @@ impl WsTransport[io, net] for WsTcp
 //         Ok(_)  => nothing()
 //         Err(_) => nothing()
 // ```
+// cov: skip — reached only with a TLS peer, which tests/tls_loopback.sh provides.
 impl WsTransport[net] for WsTls
     fn ws_send(self, data: Bytes) -> Result<Int, IoError> [net]
-        todo("websocket-nv.wstrans.WsTls.ws_send")
+        if tls.send(self.conn, data)
+            Ok(bytes.len(data))
+        else
+            Err(IoBrokenPipe)
 
     fn ws_recv(self, max: Int) -> Result<Bytes, IoError> [net]
-        todo("websocket-nv.wstrans.WsTls.ws_recv")
+        match tls.recv(self.conn, max)
+            Some(chunk) => Ok(chunk)
+            None        =>
+                // workaround(tls-recv-cannot-tell-a-receive-deadline-from-an-abrupt-close): only a close_notify names itself, so any other empty read is taken for a deadline.
+                if tls.last_error() == "tls: peer closed cleanly"
+                    Err(IoClosed)
+                else
+                    Err(IoTimedOut)
 
     fn ws_close(self) -> ?IoError [net]
-        todo("websocket-nv.wstrans.WsTls.ws_close")
+        tls.close(self.conn)
+        None
 
     fn ws_is_open(self) -> Bool
-        todo("websocket-nv.wstrans.WsTls.ws_is_open")
+        self.conn >= 0

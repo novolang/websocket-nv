@@ -1,44 +1,39 @@
-// wsserve.nv — the server side of the upgrade, and the accept-loop
-// shape an HTTP server takes.
+// wsserve.nv — the server side of the upgrade, and the shape an accept loop
+// takes.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A WebSocket server is an HTTP server with one more route. This module
+// takes an `H1Request`, http-codec-nv's request type that the server has
+// already parsed, and answers either an `H1Response` to write and forget or
+// a connection to keep.
 //
-// A WEBSOCKET SERVER IS AN HTTP SERVER WITH ONE MORE ROUTE, and the
-// shape here exists so that stays true.  `orbit/http-server` already
-// has an accept loop, a router and a request type; what it does not
-// have is a way for one route to say "this exchange stops being HTTP
-// now".  So this module takes an `H1Request` — http-codec-nv's, the
-// same one the server already parsed — and answers either an
-// `H1Response` to write and forget, or a connection to keep.
+// The decision is a value and not a callback. `upgrade` answers a
+// `WsUpgradeOutcome`, which lets a server apply its own policy between
+// parsing the request and accepting it: check the `Origin`, check a session
+// cookie, count connections per address, pick a subprotocol from the list
+// the client offered.
 //
-// THE DECISION IS A VALUE, NOT A CALLBACK.  `upgrade` answers a
-// `WsUpgradeOutcome` rather than taking a handler, which is what lets
-// a server apply its own policy between parsing the request and
-// accepting it: authenticate the Origin, check a session cookie, count
-// connections per address, pick a subprotocol from the list the client
-// offered.  A function that took a handler would have to be given all
-// of that as options it does not understand.
+// This package does not check the `Origin` and does not pick a subprotocol
+// of its own. Both are policy, and the server supplies them. `choose_protocol`
+// applies a preference order the server gives it.
 //
-// WHAT THIS PACKAGE WILL NOT DECIDE.  The codec declines to pick a
-// subprotocol or check the `Origin`, for the reason that picking would
-// be picking for every application built on it.  This package declines
-// the same two, one layer up, and hands the server the list and the
-// header instead — `choose_protocol` is a convenience over a preference
-// order the SERVER supplies, not a policy of its own.
-//
-// A REFUSED UPGRADE IS STILL AN HTTP RESPONSE, and getting that wrong
-// is the failure that looks like a hang.  A client whose handshake is
-// refused wants a status and a body it can show a person; a server
-// that closed the socket instead leaves it waiting for a response that
-// is never coming.  `refusal_response` is the answer, built from the
-// codec's `wserr.http_status_for`, and 426 with a
-// `Sec-WebSocket-Version` header is what a version mismatch gets.
+// A refused upgrade is still an HTTP response. A client whose handshake is
+// refused wants a status it can show a person, and a server that closed the
+// socket leaves it waiting for an answer that is not coming.
+// `refusal_response` builds the answer from the codec's
+// `wserr.http_status_for`, and a version mismatch gets 426 with a
+// `Sec-WebSocket-Version` field (RFC 6455 section 4.4).
 
-// What a server decides about an upgrade request.
+use h1msg
+use h1read
+use h1write
+use wserr
+use wshandshake
 use wsconn
 use wsconnerr
 use wsdeflate
+use wstrans
 
+// What a server decides about an upgrade request.
 pub enum WsUpgradeOutcome
     // Accept it: write this response, then the connection is a
     // WebSocket.  The response is `H1Response` rather than bytes so a
@@ -70,6 +65,24 @@ pub struct WsServerPolicy
     // The options every accepted connection starts with.
     options: WsConnOptions
 
+// The extensions the server accepts from an offer, given its policy.
+fn deflate_for(p: WsServerPolicy, offered: [Str]) -> WsDeflateState
+    match p.deflate
+        None         => WsDeflateOff
+        Some(limits) => wsdeflate.accept_offer(str.join(offered, ", "), limits)
+
+// The 101, with the extension answer added where one was agreed.
+fn accepted(p: WsServerPolicy, resp: H1Response, chosen: ?Str,
+            state: WsDeflateState) -> WsUpgradeOutcome
+    var h = resp.headers
+    match state
+        WsDeflateOn(params) =>
+            h = h1msg.set(h, wsdeflate.extensions_header(), wsdeflate.answer_header(params))
+        WsDeflateOff        => ()
+    WsUpgradeAccepted(
+        H1Response { version: resp.version, status: resp.status, reason: resp.reason, headers: h },
+        wsconn.connection(ServerSide, p.options, state, chosen))
+
 // A server that accepts any Origin, speaks no subprotocol, declines
 // permessage-deflate and uses `wsconn.default_options`.
 //
@@ -88,7 +101,7 @@ pub struct WsServerPolicy
 //     println("${n}")
 // ```
 pub fn policy() -> WsServerPolicy []
-    todo("websocket-nv.wsserve.policy")
+    WsServerPolicy { protocols: [], deflate: None, options: wsconn.default_options() }
 
 // The subprotocols this server speaks, most preferred first.
 //
@@ -99,7 +112,7 @@ pub fn policy() -> WsServerPolicy []
 //     wsserve.with_protocols(p, ["chat.v2", "chat.v1"])
 // ```
 pub fn with_protocols(p: WsServerPolicy, protocols: [Str]) -> WsServerPolicy []
-    todo("websocket-nv.wsserve.with_protocols")
+    WsServerPolicy { protocols: protocols, deflate: p.deflate, options: p.options }
 
 // Agree to permessage-deflate with parameters no wider than these.
 //
@@ -111,7 +124,7 @@ pub fn with_protocols(p: WsServerPolicy, protocols: [Str]) -> WsServerPolicy []
 //     wsserve.with_deflate(p, wsdeflate.default_params())
 // ```
 pub fn with_deflate(p: WsServerPolicy, d: WsDeflateParams) -> WsServerPolicy []
-    todo("websocket-nv.wsserve.with_deflate")
+    WsServerPolicy { protocols: p.protocols, deflate: Some(d), options: p.options }
 
 // The options every accepted connection starts with.
 //
@@ -123,7 +136,7 @@ pub fn with_deflate(p: WsServerPolicy, d: WsDeflateParams) -> WsServerPolicy []
 //     wsserve.with_options(p, wsconn.quiet_options())
 // ```
 pub fn with_options(p: WsServerPolicy, o: WsConnOptions) -> WsServerPolicy []
-    todo("websocket-nv.wsserve.with_options")
+    WsServerPolicy { protocols: p.protocols, deflate: p.deflate, options: o }
 
 // True when a request is asking to become a WebSocket.
 //
@@ -140,7 +153,7 @@ pub fn with_options(p: WsServerPolicy, o: WsConnOptions) -> WsServerPolicy []
 //     wsserve.is_upgrade(req)
 // ```
 pub fn is_upgrade(req: H1Request) -> Bool []
-    todo("websocket-nv.wsserve.is_upgrade")
+    wshandshake.is_websocket_upgrade(req)
 
 // What the server should do with this request.
 //
@@ -157,7 +170,16 @@ pub fn is_upgrade(req: H1Request) -> Bool []
 //     wsserve.upgrade(req, p)
 // ```
 pub fn upgrade(req: H1Request, p: WsServerPolicy) -> WsUpgradeOutcome []
-    todo("websocket-nv.wsserve.upgrade")
+    if not is_upgrade(req)
+        return WsNotAnUpgrade
+    match wshandshake.check_upgrade_request(req)
+        Err(e) => WsUpgradeRefusedWith(refusal_response(e))
+        Ok(u)  =>
+            let chosen = choose_protocol(p, u.protocols)
+            match wshandshake.upgrade_response(u.key, chosen)
+                // cov: skip — the key was checked by check_upgrade_request.
+                Err(e)   => WsUpgradeRefusedWith(refusal_response(e))
+                Ok(resp) => accepted(p, resp, chosen, deflate_for(p, u.extensions))
 
 // The subprotocol this policy picks from the list a client offered, or
 // `None`.
@@ -173,7 +195,11 @@ pub fn upgrade(req: H1Request, p: WsServerPolicy) -> WsUpgradeOutcome []
 //     wsserve.choose_protocol(p, offered)
 // ```
 pub fn choose_protocol(p: WsServerPolicy, offered: [Str]) -> ?Str []
-    todo("websocket-nv.wsserve.choose_protocol")
+    var chosen: ?Str = None
+    for mine in p.protocols
+        if chosen == None and list.contains(offered, mine)
+            chosen = Some(mine)
+    chosen
 
 // The `Origin` the request carried, if any.
 //
@@ -190,7 +216,7 @@ pub fn choose_protocol(p: WsServerPolicy, offered: [Str]) -> ?Str []
 //     wsserve.origin_of(req)
 // ```
 pub fn origin_of(req: H1Request) -> ?Str []
-    todo("websocket-nv.wsserve.origin_of")
+    h1msg.get(req.headers, "Origin")
 
 // The response a refused upgrade gets.
 //
@@ -207,7 +233,15 @@ pub fn origin_of(req: H1Request) -> ?Str []
 //     wsserve.refusal_response(e)
 // ```
 pub fn refusal_response(e: WsHandshakeError) -> H1Response []
-    todo("websocket-nv.wsserve.refusal_response")
+    match e
+        UnsupportedVersion(_) => wshandshake.version_refusal()
+        _                     =>
+            let status = wserr.http_status_for(e) ?? 400
+            H1Response {
+                version: Http11, status: status, reason: h1msg.status_reason(status),
+                headers: h1msg.headers([
+                    H1Header { name: "Content-Length", value: "0" },
+                    H1Header { name: "Connection", value: "close" }]) }
 
 // The bytes of an accepted or refused upgrade response.
 //
@@ -218,7 +252,17 @@ pub fn refusal_response(e: WsHandshakeError) -> H1Response []
 //     wsserve.response_bytes(resp)
 // ```
 pub fn response_bytes(resp: H1Response) -> Result<[u8], WsConnError> []
-    todo("websocket-nv.wsserve.response_bytes")
+    match h1write.response_head(resp)
+        Ok(head) => Ok(head)
+        Err(e)   => Err(WsHeadNotBuildable(e))
+
+// Write a refusal and report it. A transport that fails while the refusal
+// is written is reported in its place.
+fn refuse<T: WsTransport[e]>(t: T, resp: H1Response) -> Result<WsConn, WsConnError> [e]
+    let head = response_bytes(resp)!
+    match wstrans.send_all(t, head)
+        Some(err) => Err(WsSocketFailed(err))
+        None      => Err(WsUpgradeAnswered(resp.status, []))
 
 // Read one upgrade request off a freshly accepted transport, decide,
 // write the answer, and hand back what to do next.
@@ -237,4 +281,18 @@ pub fn response_bytes(resp: H1Response) -> Result<[u8], WsConnError> []
 //     wsserve.accept_upgrade(t, p)
 // ```
 pub fn accept_upgrade<T: WsTransport[e]>(t: T, p: WsServerPolicy) -> Result<WsConn, WsConnError> [e]
-    todo("websocket-nv.wsserve.accept_upgrade")
+    let got = wstrans.read_head(t, ReadsRequests)!
+    match got.event
+        RequestHead(req) =>
+            match upgrade(req, p)
+                WsUpgradeAccepted(resp, conn) =>
+                    let head = response_bytes(resp)!
+                    match wstrans.send_all(t, head)
+                        Some(err) => Err(WsSocketFailed(err))
+                        None      => Ok(wsconn.started_with(conn, "", got.rest))
+                WsUpgradeRefusedWith(resp)    =>
+                    refuse(t, resp)
+                WsNotAnUpgrade                =>
+                    refuse(t, refusal_response(WrongUpgradeToken("")))
+        // cov: skip — a request reader yields a request head only.
+        _                => Err(WsSocketFailed(IoInvalidInput("the peer sent no request head")))

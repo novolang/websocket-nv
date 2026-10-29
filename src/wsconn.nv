@@ -1,56 +1,58 @@
-// wsconn.nv — the connection value, and the close handshake that is
-// the half of RFC 6455 everybody gets wrong.
+// wsconn.nv — the connection value, and the close handshake.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// THE LOAD-BEARING VALUE IS `WsConnState`, AND THE REASON IS ITS TWO
-// CLOSING STATES.  A WebSocket does not close; it performs a
-// handshake, and the handshake is not symmetric:
+// A WebSocket does not simply close. It performs a handshake, and the
+// handshake is not symmetric, so a connection is in one of five states:
 //
 //   WsOpen           both directions carry data
-//   WsClosingLocal   we sent a close; the peer may still send DATA,
-//                    and we must still read it and answer its pings
-//   WsClosingRemote  the peer sent a close; we may send our close and
-//                    nothing else, and then the socket goes
-//   WsClosed         a close went each way, in some order
-//   WsFailed         the TCP connection went without a close frame —
-//                    1006, and 1006 may never be put on a wire
+//   WsClosingLocal   this end sent a close. The peer may still send data,
+//                    and this end must still read it and answer its pings
+//   WsClosingRemote  the peer sent a close. This end may send its own
+//                    close and nothing else
+//   WsClosed         a close went each way
+//   WsFailed         the TCP connection ended with no close frame (1006),
+//                    which is reported and never sent
 //
-// A library that modelled this as one boolean — "closed" — makes four
-// specific bugs unavoidable, and all four are Autobahn cases.  A
-// client that stops reading after sending its close never sees the
-// peer's answer and reports every clean shutdown as an abort.  One
-// that keeps sending after the close sends frames a conforming peer
-// must fail the connection over.  One that cannot tell a close frame
-// from a dropped socket reports 1006 for both, and then sends 1006
-// back, which is the one code RFC 6455 § 7.4.1 says must never travel.
-// And one with no deadline on the wait waits forever against a peer
-// that has crashed.
+// A connection modelled as one "closed" flag has four faults, and the
+// Autobahn suite tests all of them. A client that stops reading after
+// sending its close never sees the peer's answer and reports every clean
+// shutdown as an abort. One that keeps sending after the close sends
+// frames a conforming peer must fail the connection over. One that cannot
+// tell a close frame from a dropped socket reports 1006 for both and sends
+// 1006 back, which RFC 6455 section 7.4.1 forbids. One with no deadline on
+// the wait waits forever against a peer that has crashed.
 //
-// SO THERE ARE TWO DEADLINES, and they are different numbers: how long
-// to wait for the peer's close after sending ours (§ 7.1.1), and how
-// long to wait for a pong after sending a ping.  The first is the
-// protocol's; the second is the caller's policy and the RFC requires
+// There are two deadlines, and they are different numbers: how long to
+// wait for the peer's close after sending ours (section 7.1.1), and how
+// long to wait for a pong after sending a ping. The first is the
+// protocol's. The second is the caller's policy, because the RFC requires
 // no ping at all.
 //
-// THE CLOCK IS AN ARGUMENT, for the reason it is one in mqtt-nv: both
-// deadlines become tables, a caller driving many connections reads its
+// The clock is an argument. A caller driving many connections reads its
 // clock once per turn, and `now_ms` below is the only function in the
 // package that reads one.
 //
-// WHAT THIS PACKAGE ANSWERS WITHOUT BEING ASKED.  A ping is answered
-// with a pong carrying the same payload, a close is answered with a
-// close, and a decode fault is answered with the close code
-// `wsclose.close_code_for` names — all inside `pump`, all before the
-// error reaches the caller.  Those are the three things RFC 6455 says
-// an endpoint MUST do, and a library that returned them as work for
-// the caller would be a library whose callers each forget a different
-// one.
+// `pump` answers three things without being asked, because RFC 6455 says
+// an endpoint MUST: a ping is answered with a pong carrying the same
+// payload, a close is answered with a close, and a frame that breaks the
+// protocol is answered with the close code `wsclose.close_code_for` names.
+//
+// Frames are masked and unmasked here, but the arithmetic is the codec's.
+// A client masks every frame with a four-byte key. The keys come from an
+// HMAC-SHA-256 keyed with a seed the handshake drew from the system's
+// entropy, so no key can be computed from the ones already on the wire and
+// sending needs no `[rand]` row.
 
-// Where a connection is.
+use std.bytes
+use wsclose
+use wsframe
+use wsread
+use wswrite
+use wserr
+use wstrans
 use wsconnerr
 use wsdeflate
 
+// Where a connection is.
 pub enum WsConnState
     // Both directions carry data.
     WsOpen
@@ -115,6 +117,24 @@ pub struct WsConn
     // one it must not contradict is its own.
     close_sent: ?WsClose
     close_received: ?WsClose
+    // Bytes taken from the transport and not yet handed to the reader. On
+    // a connection that negotiated permessage-deflate they are cut into
+    // whole frames first, because the codec's reader refuses RSV1.
+    raw: [u8]
+    // Whether the data message now arriving began with RSV1 set.
+    compressed: Bool
+    // The decoder for the peer's messages. It carries the peer's window
+    // from one message to the next unless the peer declared
+    // `no_context_takeover`.
+    inflater: Inflater
+    // Whether a message started with `send_fragment` is still open.
+    streaming_out: Bool
+    // The seed of the client's mask keys, and how many it has drawn.
+    mask_seed: Str
+    mask_count: Int
+    // The fault that ended the connection, held until the events that
+    // came before it have been handed over. The next turn answers it.
+    failed: ?WsConnError
 
 // What a turn of the caller's loop taught it.
 pub enum WsConnEvent
@@ -150,6 +170,414 @@ pub struct WsTurn
     // come back immediately.
     wait_ms: Int
 
+// How long a caller may wait when no timer is running, in milliseconds.
+const IDLE_WAIT_MS = 60000
+
+// The most one read asks the transport for.
+const READ_MAX = 65536
+
+// The seed of a connection that was not built by a handshake. It makes the
+// mask keys repeatable, which a test wants and a program must not rely on.
+const FIXED_SEED = "novo-websocket-fixed-seed"
+
+// The connection while one turn changes it. Every field a turn may write
+// is `var`, and `conn_of` freezes the result into a `WsConn` again.
+struct Live
+    role: WsRole
+    opts: WsConnOptions
+    subprotocol: ?Str
+    mask_seed: Str
+    var state: WsConnState
+    var reader: WsReader
+    var deflate: WsDeflateState
+    var last_received_ms: Int
+    var last_ping_sent_ms: Int
+    var close_sent_ms: Int
+    var ping_pending: Bool
+    var close_sent: ?WsClose
+    var close_received: ?WsClose
+    var raw: [u8]
+    var compressed: Bool
+    var inflater: Inflater
+    var streaming_out: Bool
+    var mask_count: Int
+    var failed: ?WsConnError
+    // What the turn has produced so far.
+    var events: [WsConnEvent]
+    var out: [u8]
+    var fault: ?WsConnError
+    var halted: Bool
+
+fn live_of(c: WsConn) -> Live
+    Live {
+        role: c.role, opts: c.opts, subprotocol: c.subprotocol, mask_seed: c.mask_seed,
+        state: c.state, reader: c.reader, deflate: c.deflate,
+        last_received_ms: c.last_received_ms, last_ping_sent_ms: c.last_ping_sent_ms,
+        close_sent_ms: c.close_sent_ms, ping_pending: c.ping_pending,
+        close_sent: c.close_sent, close_received: c.close_received,
+        raw: list.clone(c.raw), compressed: c.compressed, inflater: c.inflater,
+        streaming_out: c.streaming_out, mask_count: c.mask_count, failed: c.failed,
+        events: [], out: [], fault: None, halted: false }
+
+fn conn_of(l: Live) -> WsConn
+    WsConn {
+        role: l.role, state: l.state, opts: l.opts, reader: l.reader,
+        deflate: l.deflate, subprotocol: l.subprotocol,
+        last_received_ms: l.last_received_ms, last_ping_sent_ms: l.last_ping_sent_ms,
+        close_sent_ms: l.close_sent_ms, ping_pending: l.ping_pending,
+        close_sent: l.close_sent, close_received: l.close_received,
+        raw: l.raw, compressed: l.compressed, inflater: l.inflater,
+        streaming_out: l.streaming_out, mask_seed: l.mask_seed, mask_count: l.mask_count,
+        failed: l.failed }
+
+fn smaller(a: Int, b: Int) -> Int
+    if a < b
+        a
+    else
+        b
+
+fn is_open_state(s: WsConnState) -> Bool
+    match s
+        WsOpen => true
+        _      => false
+
+// Whether this end may still read: open, or waiting for the peer's close.
+fn is_reading_state(s: WsConnState) -> Bool
+    match s
+        WsOpen         => true
+        WsClosingLocal => true
+        _              => false
+
+// Whether the peer drops its compression window after every message.
+fn peer_resets(l: Live) -> Bool
+    match l.deflate
+        WsDeflateOn(p) => wsdeflate.resets_context(p, l.role == ServerSide)
+        // cov: skip — a message is inflated only on a connection that negotiated the extension.
+        WsDeflateOff   => true
+
+// The milliseconds left before a deadline, never negative.
+fn remaining(deadline: Int, now: Int) -> Int
+    if deadline > now
+        deadline - now
+    else
+        0
+
+// The four-byte key for the nth frame of a client.
+fn mask_key_at(seed: Str, n: Int) -> [u8]
+    let digest = crypto.hmac_sha256(seed, str.from_int(n))
+    bytes.to_byte_list(bytes.from_hex(str.slice(digest, 0, 8)) ?? bytes.zeros(4))
+
+// The key for the next frame, or none on a server, which never masks.
+fn next_key(var l: Live) -> ?[u8]
+    match l.role
+        ClientSide =>
+            let key = mask_key_at(l.mask_seed, l.mask_count)
+            l.mask_count = l.mask_count + 1
+            Some(key)
+        ServerSide => None
+
+// One key for each of `count` frames, or none on a server.
+fn next_keys(var l: Live, count: Int) -> [[u8]]
+    var keys: [[u8]] = []
+    match l.role
+        ClientSide =>
+            var i = 0
+            while i < count
+                list.push(keys, mask_key_at(l.mask_seed, l.mask_count + i))
+                i = i + 1
+            l.mask_count = l.mask_count + count
+        ServerSide => ()
+    keys
+
+// A frame this module builds from values it has already checked. The
+// builders refuse only a control payload over 125 bytes, a close code that
+// cannot be sent and a mask key that is not four bytes, and none of those
+// reaches this function.
+//
+// cov: skip — the frames built here are built from checked values.
+fn bytes_of(r: Result<WsFrame, WsEncodeError>) -> [u8]
+    match r
+        Ok(f)  =>
+            match wsframe.encode(f)
+                Ok(b)  => b
+                Err(_) => []
+        Err(_) => []
+
+// A frame the caller's values may make unbuildable, as bytes. Only the
+// builders refuse; a frame they built encodes.
+fn encoded(r: Result<WsFrame, WsEncodeError>) -> Result<[u8], WsConnError>
+    match r
+        Err(e) => Err(WsFrameNotBuildable(e))
+        Ok(f)  => Ok(bytes_of(Ok(f)))
+
+fn data_frame(op: WsOpcode, fin: Bool, packed: Bool, payload: [u8], key: ?[u8]) -> WsFrame
+    WsFrame {
+        header: WsFrameHeader {
+            fin: fin, rsv1: packed, rsv2: false, rsv3: false, opcode: op,
+            masked: key != None, payload_len: list.len(payload), mask_key: key },
+        payload: payload }
+
+// Put a close frame on the turn's outgoing bytes.
+fn queue_close(var l: Live, k: WsClose)
+    list.append(l.out, bytes_of(wswrite.close_frame(k, next_key(var l))))
+
+// Put a ping on the turn's outgoing bytes and start its deadline.
+fn queue_ping(var l: Live, payload: [u8], now: Int)
+    list.append(l.out, bytes_of(wswrite.ping(payload, next_key(var l))))
+    l.last_ping_sent_ms = now
+    l.ping_pending = true
+
+// End the turn with a fault, after telling the peer why.
+fn fail_with(var l: Live, code: WsCloseCode, fault: WsConnError)
+    queue_close(var l, WsClose { code: code, reason: "" })
+    l.fault = Some(fault)
+    l.halted = true
+
+// The payload of a data message that arrived, in whichever form.
+fn payload_of(msg: WsMessage) -> [u8]
+    match msg
+        TextMessage(utf8) => list.clone(utf8)
+        BinaryMessage(d)  => list.clone(d)
+
+fn is_text(msg: WsMessage) -> Bool
+    match msg
+        TextMessage(_)   => true
+        BinaryMessage(_) => false
+
+// A compressed payload inflated through the peer's decoder.
+fn inflated(var l: Live, payload: [u8], last: Bool) -> Result<[u8], WsConnError>
+    let budget = l.opts.limits.max_message
+    match wsdeflate.inflate_step(l.inflater, bytes.from_byte_list(payload), last, budget)
+        Err(OutputTooLarge(_, cap)) => Err(WsMessageTooLargeToAssemble(cap + 1, cap))
+        Err(e)                      => Err(WsInflateFailed(e))
+        Ok(pair)                    =>
+            if last and peer_resets(l)
+                l.inflater = wsdeflate.new_inflater()
+            else
+                l.inflater = pair.0
+            Ok(bytes.to_byte_list(pair.1))
+
+// The close code a fault from `inflated` or the text check owes the peer.
+fn code_of_fault(f: WsConnError) -> WsCloseCode
+    wsconnerr.close_code_for(f) ?? InternalError
+
+fn fail_fault(var l: Live, f: WsConnError)
+    fail_with(var l, code_of_fault(f), f)
+
+// A whole data message, once reassembled.
+fn on_message(var l: Live, msg: WsMessage)
+    var payload = payload_of(msg)
+    if l.compressed
+        match inflated(var l, payload, true)
+            Err(f)    =>
+                fail_fault(var l, f)
+                return
+            Ok(plain) =>
+                payload = list.clone(plain)
+    if is_text(msg) and not wsread.is_valid_utf8(payload)
+        fail_fault(var l, WsTextNotUtf8)
+        return
+    if is_text(msg)
+        list.push(l.events, WsMessageReceived(TextMessage(payload)))
+    else
+        list.push(l.events, WsMessageReceived(BinaryMessage(payload)))
+
+// One frame of a message that is not being reassembled.
+fn on_fragment(var l: Live, f: WsFrame)
+    var payload = list.clone(f.payload)
+    if l.compressed
+        match inflated(var l, payload, f.header.fin)
+            Err(fault) =>
+                fail_fault(var l, fault)
+                return
+            Ok(plain)  =>
+                payload = list.clone(plain)
+    let h = f.header
+    list.push(l.events, WsFragmentReceived(WsFrame {
+        header: WsFrameHeader {
+            fin: h.fin, rsv1: false, rsv2: h.rsv2, rsv3: h.rsv3, opcode: h.opcode,
+            masked: h.masked, payload_len: list.len(payload), mask_key: h.mask_key },
+        payload: payload }))
+
+fn on_pong(var l: Live, now: Int)
+    if l.ping_pending
+        l.ping_pending = false
+        list.push(l.events, WsPongReceived(now - l.last_ping_sent_ms))
+
+// The peer's close. It ends what this turn reads, because nothing legal
+// follows it.
+fn on_peer_close(var l: Live, k: WsClose)
+    l.close_received = Some(k)
+    l.halted = true
+    l.state = WsClosed
+    if l.close_sent == None
+        // The peer began the handshake, and this end answers with the
+        // same code where that code may travel.
+        var echo = WsClose { code: NormalClosure, reason: "" }
+        if wsclose.is_sendable(k.code)
+            echo = WsClose { code: k.code, reason: "" }
+        queue_close(var l, echo)
+        l.close_sent = Some(echo)
+        list.push(l.events, WsCloseReceived(k))
+    list.push(l.events, WsCloseCompleted)
+
+fn on_event(var l: Live, ev: WsEvent, now: Int)
+    match ev
+        DataMessage(msg) => on_message(var l, msg)
+        DataFrame(f)     =>
+            if l.opts.limits.max_message == 0
+                on_fragment(var l, f)
+        ControlPing(p)   =>
+            list.append(l.out, bytes_of(wswrite.pong(p, next_key(var l))))
+            list.push(l.events, WsPingAnswered(p))
+        ControlPong(_)   => on_pong(var l, now)
+        PeerClose(k)     => on_peer_close(var l, k)
+
+// Give the reader a piece of the stream and act on every event it makes.
+fn feed_piece(var l: Live, piece: [u8], now: Int)
+    var step = wsread.feed(l.reader, piece)
+    var more = true
+    while more and not l.halted
+        match step
+            Err(e) =>
+                let code = wsclose.close_code_for(e)
+                fail_with(var l, code, WsFrameRefused(e))
+            Ok(s)  =>
+                l.reader = s.reader
+                match s.event
+                    None     =>
+                        more = false
+                    Some(ev) =>
+                        on_event(var l, ev, now)
+                        step = wsread.take(l.reader)
+
+// The payload length a frame header declares, or -1 while the length
+// field has not all arrived or the length cannot be held.
+fn declared_len(buf: [u8]) -> Int
+    if list.len(buf) < 2
+        return -1
+    let len7 = buf[1] as Int & 0x7F
+    if len7 < 126
+        return len7
+    if len7 == 126
+        if list.len(buf) < 4
+            return -1
+        return (buf[2] as Int << 8) | buf[3] as Int
+    if list.len(buf) < 10
+        return -1
+    if (buf[2] as Int & 0x80) != 0
+        return -1
+    var n = 0
+    for i in 0..8
+        n = (n << 8) | (buf[2 + i] as Int & 0xFF)
+    n
+
+// One whole frame as the codec's reader will see it. The first frame of a
+// compressed message carries RSV1, which the reader refuses, so the bit is
+// cleared in a copy and remembered for the message. RSV1 anywhere else is
+// left set and the reader refuses it, as RFC 7692 section 6.1 requires.
+fn marked(var l: Live, frame: [u8]) -> [u8]
+    let b0 = frame[0] as Int
+    let op = b0 & 0x0F
+    let first_of_data = op == 1 or op == 2
+    if first_of_data
+        l.compressed = (b0 & 0x40) != 0
+    if first_of_data and l.compressed
+        var copy = list.clone(frame)
+        copy[0] = (b0 & 0xBF) as u8
+        return copy
+    list.clone(frame)
+
+// Cut the bytes held back into whole frames and give each to the reader.
+fn feed_frames(var l: Live, now: Int)
+    var going = true
+    while going and not l.halted
+        match wsframe.scan(l.raw)
+            NeedMore        =>
+                going = false
+                if declared_len(l.raw) > l.opts.limits.max_frame
+                    // The reader refuses a frame by its declared length
+                    // before the frame has all arrived.
+                    let held = l.raw
+                    l.raw = []
+                    feed_piece(var l, held, now)
+            Complete(whole) =>
+                let frame = l.raw[0:whole]
+                l.raw = l.raw[whole:list.len(l.raw)]
+                feed_piece(var l, marked(var l, frame), now)
+
+// Everything the turn has been given, read.
+fn ingest(var l: Live, now: Int)
+    match l.deflate
+        WsDeflateOn(_) =>
+            feed_frames(var l, now)
+        WsDeflateOff   =>
+            let held = l.raw
+            l.raw = []
+            feed_piece(var l, held, now)
+
+// The timers, which can end a turn or add a ping to it.
+fn run_timers(var l: Live, now: Int)
+    let c = conn_of(l)
+    if close_expired(c, now)
+        l.fault = Some(WsCloseTimedOut(now - c.close_sent_ms))
+    else if pong_expired(c, now)
+        l.fault = Some(WsPongTimedOut(now - c.last_ping_sent_ms))
+    else if ping_due(c, now)
+        queue_ping(var l, [], now)
+
+// A message or a fragment, framed and put on the turn's outgoing bytes.
+fn queue_message(var l: Live, data: [u8], text: Bool)
+    var payload = list.clone(data)
+    var packed = false
+    match l.deflate
+        WsDeflateOn(p) =>
+            if l.opts.compress_outgoing and wsdeflate.worth_compressing(list.len(data))
+                payload = bytes.to_byte_list(deflated(bytes.from_byte_list(data), p, l.role == ClientSide))
+                packed = true
+        WsDeflateOff   => ()
+    var op = BinaryFrame
+    if text
+        op = TextFrame
+    let size = l.opts.max_send_frame
+    let count = wswrite.frame_count(list.len(payload), size)
+    let keys = next_keys(var l, count)
+    var at = 0
+    for index in 0..count
+        var hi = at + size
+        if hi > list.len(payload)
+            hi = list.len(payload)
+        var key: ?[u8] = None
+        if list.len(keys) > 0
+            key = Some(keys[index])
+        var frame_op = op
+        if index > 0
+            frame_op = Continuation
+        let f = data_frame(frame_op, index == count - 1, packed and index == 0, payload[at:hi], key)
+        list.append(l.out, bytes_of(Ok(f)))
+        at = hi
+
+// The compressed form of a payload, which `wsdeflate.compress` answers for
+// every input.
+//
+// cov: skip — compress answers Ok for every input.
+fn deflated(payload: Bytes, p: WsDeflateParams, is_client: Bool) -> Bytes
+    match wsdeflate.compress(payload, p, is_client)
+        Ok(b)  => b
+        Err(_) => bytes.clone(payload)
+
+// The turn a send ends with: nothing arrived, and the clock says when to
+// come back.
+fn sent_turn(l: Live, now: Int) -> WsTurn
+    let c = conn_of(l)
+    WsTurn { conn: c, events: l.events, wait_ms: wait_ms(c, now) }
+
+// Put a send's bytes on the transport and end the turn.
+fn finish_send<T: WsTransport[e]>(l: Live, t: T, now: Int) -> Result<WsTurn, WsConnError> [e]
+    match wstrans.send_all(t, l.out)
+        Some(err) => Err(WsSocketFailed(err))
+        None      => Ok(sent_turn(l, now))
+
 // The default options: the codec's default limits, a five-second close
 // timeout, a ten-second pong timeout, a thirty-second ping interval,
 // 64 KiB frames and compression on where it was negotiated.
@@ -161,7 +589,9 @@ pub struct WsTurn
 //     println("${wsconn.default_options().close_timeout_ms}")
 // ```
 pub fn default_options() -> WsConnOptions []
-    todo("websocket-nv.wsconn.default_options")
+    WsConnOptions {
+        limits: wsread.default_limits(), close_timeout_ms: 5000, pong_timeout_ms: 10000,
+        ping_interval_ms: 30000, max_send_frame: 65536, compress_outgoing: true }
 
 // The options with no timers at all: no ping, no pong deadline, and a
 // close timeout only.
@@ -177,7 +607,9 @@ pub fn default_options() -> WsConnOptions []
 //     println("${wsconn.quiet_options().ping_interval_ms}")
 // ```
 pub fn quiet_options() -> WsConnOptions []
-    todo("websocket-nv.wsconn.quiet_options")
+    WsConnOptions {
+        limits: wsread.default_limits(), close_timeout_ms: 5000, pong_timeout_ms: 0,
+        ping_interval_ms: 0, max_send_frame: 65536, compress_outgoing: true }
 
 // A connection over a completed handshake.
 //
@@ -194,7 +626,40 @@ pub fn quiet_options() -> WsConnOptions []
 //     wsconn.connection(r, o, d, None)
 // ```
 pub fn connection(role: WsRole, o: WsConnOptions, d: WsDeflateState, subprotocol: ?Str) -> WsConn []
-    todo("websocket-nv.wsconn.connection")
+    WsConn {
+        role: role, state: WsOpen, opts: o, reader: wsread.reader(role, o.limits),
+        deflate: d, subprotocol: subprotocol,
+        last_received_ms: 0, last_ping_sent_ms: 0, close_sent_ms: 0, ping_pending: false,
+        close_sent: None, close_received: None,
+        raw: [], compressed: false, inflater: wsdeflate.new_inflater(),
+        streaming_out: false, mask_seed: FIXED_SEED, mask_count: 0, failed: None }
+
+// The same connection with a seed for its mask keys and the bytes the
+// transport delivered after the handshake.
+//
+// The client's handshake draws the seed from the system's entropy, and
+// whatever followed the HTTP head on the wire belongs to the first turn.
+// A connection built by hand with `connection` has a fixed seed, which makes
+// its mask keys repeatable and is for tests.
+//
+// ```novo
+// use wsconn
+//
+// fn main() [io]
+//     let c = wsconn.connection(ClientSide, wsconn.default_options(), WsDeflateOff, None)
+//     let started = wsconn.started_with(c, "a seed", [])
+//     println("${wsconn.can_send(started)}")
+// ```
+pub fn started_with(c: WsConn, mask_seed: Str, received: [u8]) -> WsConn []
+    WsConn {
+        role: c.role, state: c.state, opts: c.opts, reader: c.reader,
+        deflate: c.deflate, subprotocol: c.subprotocol,
+        last_received_ms: c.last_received_ms, last_ping_sent_ms: c.last_ping_sent_ms,
+        close_sent_ms: c.close_sent_ms, ping_pending: c.ping_pending,
+        close_sent: c.close_sent, close_received: c.close_received,
+        raw: received, compressed: c.compressed, inflater: c.inflater,
+        streaming_out: c.streaming_out, mask_seed: mask_seed, mask_count: c.mask_count,
+        failed: c.failed }
 
 // Where the connection is.
 //
@@ -207,7 +672,7 @@ pub fn connection(role: WsRole, o: WsConnOptions, d: WsDeflateState, subprotocol
 //         _      => false
 // ```
 pub fn state_of(c: WsConn) -> WsConnState []
-    todo("websocket-nv.wsconn.state_of")
+    c.state
 
 // True while data may still be SENT — which is only in `WsOpen`.
 //
@@ -223,7 +688,7 @@ pub fn state_of(c: WsConn) -> WsConnState []
 //     wsconn.can_send(c)
 // ```
 pub fn can_send(c: WsConn) -> Bool []
-    todo("websocket-nv.wsconn.can_send")
+    is_open_state(c.state)
 
 // True while data may still ARRIVE — which is in `WsOpen` and in
 // `WsClosingLocal`.
@@ -241,7 +706,7 @@ pub fn can_send(c: WsConn) -> Bool []
 //     wsconn.can_receive(c)
 // ```
 pub fn can_receive(c: WsConn) -> Bool []
-    todo("websocket-nv.wsconn.can_receive")
+    is_reading_state(c.state)
 
 // A monotonic millisecond reading.
 //
@@ -255,7 +720,7 @@ pub fn can_receive(c: WsConn) -> Bool []
 //     println("${wsconn.now_ms() >= 0}")
 // ```
 pub fn now_ms() -> Int [time]
-    todo("websocket-nv.wsconn.now_ms")
+    time.ticks()
 
 // One turn: read what the transport has, answer what must be answered,
 // send a ping if one is due, and fail the connection if a deadline has
@@ -277,7 +742,39 @@ pub fn now_ms() -> Int [time]
 //     wsconn.pump(c, t, wsconn.now_ms())
 // ```
 pub fn pump<T: WsTransport[e]>(c: WsConn, t: T, now_ms: Int) -> Result<WsTurn, WsConnError> [e]
-    todo("websocket-nv.wsconn.pump")
+    match c.failed
+        Some(f) =>
+            return Err(f)
+        None    => ()
+    if not is_reading_state(c.state)
+        return Ok(WsTurn { conn: c, events: [], wait_ms: 0 })
+    var l = live_of(c)
+    match t.ws_recv(READ_MAX)
+        Err(IoTimedOut) => ()
+        Err(other)      =>
+            return Err(WsSocketFailed(other))
+        Ok(chunk)       =>
+            if bytes.len(chunk) == 0
+                if not t.ws_is_open()
+                    return Err(WsSocketFailed(IoClosed))
+            else
+                l.last_received_ms = now_ms
+                list.append(l.raw, bytes.to_byte_list(chunk))
+    ingest(var l, now_ms)
+    if l.fault == None and not l.halted
+        run_timers(var l, now_ms)
+    let sent = wstrans.send_all(t, l.out)
+    match l.fault
+        Some(f) =>
+            // Events that came before the fault are delivered first.
+            if list.len(l.events) == 0
+                return Err(f)
+            l.failed = Some(f)
+            l.state = WsFailed
+        None    => ()
+    match sent
+        Some(err) => Err(WsSocketFailed(err))
+        None      => Ok(sent_turn(l, now_ms))
 
 // Send a text message.
 //
@@ -296,7 +793,11 @@ pub fn pump<T: WsTransport[e]>(c: WsConn, t: T, now_ms: Int) -> Result<WsTurn, W
 // ```
 pub fn send_text<T: WsTransport[e]>(c: WsConn, t: T, utf8: [u8],
                                     now_ms: Int) -> Result<WsTurn, WsConnError> [e]
-    todo("websocket-nv.wsconn.send_text")
+    if not is_open_state(c.state)
+        return Err(WsAlreadyClosing)
+    var l = live_of(c)
+    queue_message(var l, utf8, true)
+    finish_send(l, t, now_ms)
 
 // Send a binary message.
 //
@@ -309,7 +810,11 @@ pub fn send_text<T: WsTransport[e]>(c: WsConn, t: T, utf8: [u8],
 // ```
 pub fn send_binary<T: WsTransport[e]>(c: WsConn, t: T, data: [u8],
                                       now_ms: Int) -> Result<WsTurn, WsConnError> [e]
-    todo("websocket-nv.wsconn.send_binary")
+    if not is_open_state(c.state)
+        return Err(WsAlreadyClosing)
+    var l = live_of(c)
+    queue_message(var l, data, false)
+    finish_send(l, t, now_ms)
 
 // Send one fragment of a message the caller is streaming.
 //
@@ -327,7 +832,15 @@ pub fn send_binary<T: WsTransport[e]>(c: WsConn, t: T, data: [u8],
 // ```
 pub fn send_fragment<T: WsTransport[e]>(c: WsConn, t: T, part: [u8], fin: Bool,
                                         now_ms: Int) -> Result<WsTurn, WsConnError> [e]
-    todo("websocket-nv.wsconn.send_fragment")
+    if not is_open_state(c.state)
+        return Err(WsAlreadyClosing)
+    var l = live_of(c)
+    var op = BinaryFrame
+    if l.streaming_out
+        op = Continuation
+    list.append(l.out, bytes_of(Ok(data_frame(op, fin, false, part, next_key(var l)))))
+    l.streaming_out = not fin
+    finish_send(l, t, now_ms)
 
 // Send a ping with a payload of the caller's choosing.
 //
@@ -343,7 +856,18 @@ pub fn send_fragment<T: WsTransport[e]>(c: WsConn, t: T, part: [u8], fin: Bool,
 // ```
 pub fn send_ping<T: WsTransport[e]>(c: WsConn, t: T, payload: [u8],
                                     now_ms: Int) -> Result<WsTurn, WsConnError> [e]
-    todo("websocket-nv.wsconn.send_ping")
+    if not is_open_state(c.state)
+        return Err(WsAlreadyClosing)
+    var l = live_of(c)
+    let built = encoded(wswrite.ping(payload, next_key(var l)))
+    match built
+        Err(e)    =>
+            Err(e)
+        Ok(frame) =>
+            list.append(l.out, frame)
+            l.last_ping_sent_ms = now_ms
+            l.ping_pending = true
+            finish_send(l, t, now_ms)
 
 // Begin the close handshake.
 //
@@ -363,7 +887,19 @@ pub fn send_ping<T: WsTransport[e]>(c: WsConn, t: T, payload: [u8],
 // ```
 pub fn close<T: WsTransport[e]>(c: WsConn, t: T, k: WsClose,
                                 now_ms: Int) -> Result<WsTurn, WsConnError> [e]
-    todo("websocket-nv.wsconn.close")
+    if not is_open_state(c.state)
+        return Err(WsAlreadyClosing)
+    var l = live_of(c)
+    let built = encoded(wswrite.close_frame(k, next_key(var l)))
+    match built
+        Err(e)    =>
+            Err(e)
+        Ok(frame) =>
+            list.append(l.out, frame)
+            l.state = WsClosingLocal
+            l.close_sent = Some(k)
+            l.close_sent_ms = now_ms
+            finish_send(l, t, now_ms)
 
 // The close the peer sent, once it has.
 //
@@ -379,7 +915,7 @@ pub fn close<T: WsTransport[e]>(c: WsConn, t: T, k: WsClose,
 //     wsconn.peer_close(c)
 // ```
 pub fn peer_close(c: WsConn) -> ?WsClose []
-    todo("websocket-nv.wsconn.peer_close")
+    c.close_received
 
 // The close this endpoint sent, once it has.
 //
@@ -390,7 +926,7 @@ pub fn peer_close(c: WsConn) -> ?WsClose []
 //     wsconn.local_close(c)
 // ```
 pub fn local_close(c: WsConn) -> ?WsClose []
-    todo("websocket-nv.wsconn.local_close")
+    c.close_sent
 
 // How long the caller may wait before pumping again.
 //
@@ -404,7 +940,19 @@ pub fn local_close(c: WsConn) -> ?WsClose []
 //     wsconn.wait_ms(c, now_ms)
 // ```
 pub fn wait_ms(c: WsConn, now_ms: Int) -> Int []
-    todo("websocket-nv.wsconn.wait_ms")
+    var best = IDLE_WAIT_MS
+    match c.state
+        WsClosingLocal =>
+            if c.opts.close_timeout_ms > 0
+                best = smaller(best, remaining(c.close_sent_ms + c.opts.close_timeout_ms, now_ms))
+        WsOpen         =>
+            if c.ping_pending
+                if c.opts.pong_timeout_ms > 0
+                    best = smaller(best, remaining(c.last_ping_sent_ms + c.opts.pong_timeout_ms, now_ms))
+            else if c.opts.ping_interval_ms > 0
+                best = smaller(best, remaining(c.last_received_ms + c.opts.ping_interval_ms, now_ms))
+        _              => ()
+    best
 
 // True when the close handshake has been waiting longer than
 // `close_timeout_ms`.
@@ -421,7 +969,10 @@ pub fn wait_ms(c: WsConn, now_ms: Int) -> Int []
 //     wsconn.close_expired(c, now_ms)
 // ```
 pub fn close_expired(c: WsConn, now_ms: Int) -> Bool []
-    todo("websocket-nv.wsconn.close_expired")
+    match c.state
+        WsClosingLocal =>
+            c.opts.close_timeout_ms > 0 and now_ms - c.close_sent_ms >= c.opts.close_timeout_ms
+        _              => false
 
 // True when a ping has gone unanswered longer than `pong_timeout_ms`.
 //
@@ -432,7 +983,8 @@ pub fn close_expired(c: WsConn, now_ms: Int) -> Bool []
 //     wsconn.pong_expired(c, now_ms)
 // ```
 pub fn pong_expired(c: WsConn, now_ms: Int) -> Bool []
-    todo("websocket-nv.wsconn.pong_expired")
+    c.ping_pending and c.opts.pong_timeout_ms > 0
+        and now_ms - c.last_ping_sent_ms >= c.opts.pong_timeout_ms
 
 // True when a ping is due at this reading.
 //
@@ -443,7 +995,8 @@ pub fn pong_expired(c: WsConn, now_ms: Int) -> Bool []
 //     wsconn.ping_due(c, now_ms)
 // ```
 pub fn ping_due(c: WsConn, now_ms: Int) -> Bool []
-    todo("websocket-nv.wsconn.ping_due")
+    is_open_state(c.state) and not c.ping_pending and c.opts.ping_interval_ms > 0
+        and now_ms - c.last_received_ms >= c.opts.ping_interval_ms
 
 // The subprotocol the handshake settled on, if any.
 //
@@ -454,7 +1007,7 @@ pub fn ping_due(c: WsConn, now_ms: Int) -> Bool []
 //     wsconn.subprotocol_of(c)
 // ```
 pub fn subprotocol_of(c: WsConn) -> ?Str []
-    todo("websocket-nv.wsconn.subprotocol_of")
+    c.subprotocol
 
 // What permessage-deflate negotiated on this connection, or that it
 // did not.
@@ -466,4 +1019,4 @@ pub fn subprotocol_of(c: WsConn) -> ?Str []
 //     wsconn.deflate_of(c)
 // ```
 pub fn deflate_of(c: WsConn) -> WsDeflateState []
-    todo("websocket-nv.wsconn.deflate_of")
+    c.deflate
