@@ -4,15 +4,15 @@
 source = "registry"
 url = "https://registry.novo-lang.org"
 req = "^0.1"
-version = "0.1.3"
-hash = "b0bf3b342541097171db05e4fb7e0000b023bee24040eb5476398beeb9176d35"
+version = "0.1.7"
+hash = "c379e61661ab8e15a2058253f86c6f86d31b697ff1c0f060c176ea30dd45c4c5"
 
 [flate-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "94526969eb11b1c539e1eaad561a1036c127902eb4d4c467f9c12fc098e4790c"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "819c661d01f51e8c7174485d8e1c5903f8078115353390b657f4fe888b262c94"
 
 [http-codec-nv]
 source = "registry"
@@ -24,6 +24,6 @@ hash = "4265f9e51f7897955af1809e2ccf5a75f22c217b18f7d77bca9919d5d2a5b45c"
 [websocket-codec-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.6"
-version = "0.0.6"
-hash = "105ee165eb29b6c8ad35254981db535133ca83d2eb918935c3a6324ce96c7f4d"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "1d41367e367ef043bdac92163b179f30a9e0679777fb515ede51da37a0738263"

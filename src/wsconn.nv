@@ -123,6 +123,9 @@ pub struct WsConn
     raw: [u8]
     // Whether the data message now arriving began with RSV1 set.
     compressed: Bool
+    // Whether that message is text. The reader is given it as binary, so
+    // that it does not check the compressed bytes for UTF-8.
+    compressed_text: Bool
     // The decoder for the peer's messages. It carries the peer's window
     // from one message to the next unless the peer declared
     // `no_context_takeover`.
@@ -198,6 +201,7 @@ struct Live
     var close_received: ?WsClose
     var raw: [u8]
     var compressed: Bool
+    var compressed_text: Bool
     var inflater: Inflater
     var streaming_out: Bool
     var mask_count: Int
@@ -208,14 +212,22 @@ struct Live
     var fault: ?WsConnError
     var halted: Bool
 
+// A reader of its own, so that a connection value is not changed by a turn
+// taken from it.
+fn copy_of(r: WsReader) -> WsReader
+    WsReader {
+        role: r.role, limits: r.limits, pending: list.clone(r.pending),
+        assembling: list.clone(r.assembling), consumed: r.consumed, open: r.open,
+        owed: r.owed, peer_close: r.peer_close }
+
 fn live_of(c: WsConn) -> Live
     Live {
         role: c.role, opts: c.opts, subprotocol: c.subprotocol, mask_seed: c.mask_seed,
-        state: c.state, reader: c.reader, deflate: c.deflate,
+        state: c.state, reader: copy_of(c.reader), deflate: c.deflate,
         last_received_ms: c.last_received_ms, last_ping_sent_ms: c.last_ping_sent_ms,
         close_sent_ms: c.close_sent_ms, ping_pending: c.ping_pending,
         close_sent: c.close_sent, close_received: c.close_received,
-        raw: list.clone(c.raw), compressed: c.compressed, inflater: c.inflater,
+        raw: list.clone(c.raw), compressed: c.compressed, compressed_text: c.compressed_text, inflater: c.inflater,
         streaming_out: c.streaming_out, mask_count: c.mask_count, failed: c.failed,
         events: [], out: [], fault: None, halted: false }
 
@@ -226,7 +238,7 @@ fn conn_of(l: Live) -> WsConn
         last_received_ms: l.last_received_ms, last_ping_sent_ms: l.last_ping_sent_ms,
         close_sent_ms: l.close_sent_ms, ping_pending: l.ping_pending,
         close_sent: l.close_sent, close_received: l.close_received,
-        raw: l.raw, compressed: l.compressed, inflater: l.inflater,
+        raw: l.raw, compressed: l.compressed, compressed_text: l.compressed_text, inflater: l.inflater,
         streaming_out: l.streaming_out, mask_seed: l.mask_seed, mask_count: l.mask_count,
         failed: l.failed }
 
@@ -374,10 +386,14 @@ fn on_message(var l: Live, msg: WsMessage)
                 return
             Ok(plain) =>
                 payload = list.clone(plain)
-    if is_text(msg) and not wsread.is_valid_utf8(payload)
+    let text = if l.compressed
+        l.compressed_text
+    else
+        is_text(msg)
+    if text and not wsread.is_valid_utf8(payload)
         fail_fault(var l, WsTextNotUtf8)
         return
-    if is_text(msg)
+    if text
         list.push(l.events, WsMessageReceived(TextMessage(payload)))
     else
         list.push(l.events, WsMessageReceived(BinaryMessage(payload)))
@@ -482,9 +498,15 @@ fn marked(var l: Live, frame: [u8]) -> [u8]
     let first_of_data = op == 1 or op == 2
     if first_of_data
         l.compressed = (b0 & 0x40) != 0
+        l.compressed_text = op == 1
     if first_of_data and l.compressed
         var copy = list.clone(frame)
-        copy[0] = (b0 & 0xBF) as u8
+        // A message that is being reassembled is handed over as binary.
+        let kind = if l.opts.limits.max_message > 0
+            2
+        else
+            op
+        copy[0] = ((b0 & 0xB0) | kind) as u8
         return copy
     list.clone(frame)
 
@@ -631,7 +653,7 @@ pub fn connection(role: WsRole, o: WsConnOptions, d: WsDeflateState, subprotocol
         deflate: d, subprotocol: subprotocol,
         last_received_ms: 0, last_ping_sent_ms: 0, close_sent_ms: 0, ping_pending: false,
         close_sent: None, close_received: None,
-        raw: [], compressed: false, inflater: wsdeflate.new_inflater(),
+        raw: [], compressed: false, compressed_text: false, inflater: wsdeflate.new_inflater(),
         streaming_out: false, mask_seed: FIXED_SEED, mask_count: 0, failed: None }
 
 // The same connection with a seed for its mask keys and the bytes the
@@ -657,7 +679,7 @@ pub fn started_with(c: WsConn, mask_seed: Str, received: [u8]) -> WsConn []
         last_received_ms: c.last_received_ms, last_ping_sent_ms: c.last_ping_sent_ms,
         close_sent_ms: c.close_sent_ms, ping_pending: c.ping_pending,
         close_sent: c.close_sent, close_received: c.close_received,
-        raw: received, compressed: c.compressed, inflater: c.inflater,
+        raw: received, compressed: c.compressed, compressed_text: c.compressed_text, inflater: c.inflater,
         streaming_out: c.streaming_out, mask_seed: mask_seed, mask_count: c.mask_count,
         failed: c.failed }
 

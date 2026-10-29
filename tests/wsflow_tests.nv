@@ -148,10 +148,7 @@ fn fr(b0: Int, payload: [u8], key: [u8]) -> [u8]
             shift = shift - 8
     if list.len(key) > 0
         list.append(out, key)
-        var i = 0
-        while i < n
-            list.push(out, (payload[i] as Int ^ key[i % 4] as Int) as u8)
-            i = i + 1
+        list.append(out, list.map(list.range(0, n), i => (payload[i] as Int ^ key[i % 4] as Int) as u8))
     else
         list.append(out, payload)
     out
@@ -392,12 +389,7 @@ fn test_a_clients_mask_keys_differ_from_frame_to_frame() [mutate]
         list.push(seen, tohex(g_out[at + 2:at + 6]))
         at = at + 14
     test.assert_eq(list.len(seen), 6)
-    var distinct = 0
-    var j = 0
-    while j < 6
-        if not list.contains(seen[0:j], seen[j])
-            distinct = distinct + 1
-        j = j + 1
+    let distinct = list.count(list.range(0, 6), j => not list.contains(seen[0:j], seen[j]))
     test.assert_eq(distinct, 6)
 
 @test
