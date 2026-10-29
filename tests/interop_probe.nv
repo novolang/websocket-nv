@@ -1,0 +1,99 @@
+// interop_probe.nv — a client for tests/interop.sh, against a server that is
+// not this package. It sends the messages the script names and prints what
+// comes back.
+
+use std.env
+use std.bytes
+use wsclient
+use wsclose
+use wsconn
+use wsdeflate
+use wstrans
+
+fn main() [io, net, rand, time]
+    let port = str.to_int(env.get("INTEROP_PORT") ?? "0") ?? 0
+    let compress = (env.get("INTEROP_DEFLATE") ?? "") == "deflate"
+    var request = wsclient.request(WsAddress { secure: false, host: "127.0.0.1", port: port, target: "/echo" })
+    if compress
+        request = wsclient.with_deflate(request, WsDeflateParams {
+            server_no_context_takeover: false, client_no_context_takeover: false,
+            server_max_window_bits: 15, client_max_window_bits: 15 })
+    match wstrans.dial_tcp("127.0.0.1", port)
+        Err(_) => println("dial failed")
+        Ok(t)  =>
+            match wsclient.connect(t, request, wsconn.default_options())
+                Err(e) => println("connect failed: ${e.message()}")
+                Ok(c)  =>
+                    println("deflate ${wsconn.deflate_of(c)}")
+                    exchange(c, t)
+
+fn wait_for_message(c: WsConn, t: WsTcp) -> Result<(WsConn, WsMessage), WsConnError> [io, net, time]
+    match wsconn.pump(c, t, wsconn.now_ms())
+        Err(e)   => Err(e)
+        Ok(turn) =>
+            var found: ?WsMessage = None
+            for ev in turn.events
+                match ev
+                    WsMessageReceived(m) =>
+                        found = Some(m)
+                    _                    => ()
+            match found
+                Some(m) => Ok((turn.conn, m))
+                None    => wait_for_message(turn.conn, t)
+
+struct Echo
+    line: Str
+    conn: WsConn
+
+fn echoed(c: WsConn, t: WsTcp, sent: [u8], text: Bool) -> Echo [io, net, time]
+    let step = if text
+        wsconn.send_text(c, t, sent, wsconn.now_ms())
+    else
+        wsconn.send_binary(c, t, sent, wsconn.now_ms())
+    match step
+        Err(e)   => Echo { line: "send failed: ${e.message()}", conn: c }
+        Ok(turn) =>
+            match wait_for_message(turn.conn, t)
+                Err(e)   => Echo { line: "receive failed: ${e.message()}", conn: turn.conn }
+                Ok(pair) =>
+                    let back = match pair.1
+                        TextMessage(b)   => b
+                        BinaryMessage(b) => b
+                    if back == sent
+                        Echo { line: "echoed ${list.len(sent)}", conn: pair.0 }
+                    else
+                        Echo { line: "MISMATCH ${list.len(sent)} ${list.len(back)}", conn: pair.0 }
+
+fn exchange(c: WsConn, t: WsTcp) [io, net, time]
+    let a = echoed(c, t, bytes.to_byte_list(bytes.from_str("hello from novo")), true)
+    println(a.line)
+    var long: [u8] = []
+    var i = 0
+    while i < 200000
+        list.push(long, (97 + i % 7) as u8)
+        i = i + 1
+    let b = echoed(a.conn, t, long, true)
+    println(b.line)
+    var bin: [u8] = []
+    i = 0
+    while i < 70000
+        list.push(bin, (i % 251) as u8)
+        i = i + 1
+    let d = echoed(b.conn, t, bin, false)
+    println(d.line)
+    let e = echoed(d.conn, t, [], true)
+    println(e.line)
+    match wsconn.close(e.conn, t, WsClose { code: NormalClosure, reason: "bye" }, wsconn.now_ms())
+        Err(err) => println("close failed: ${err.message()}")
+        Ok(turn) =>
+            match wait_for_close(turn.conn, t)
+                Some(k) => println("closed ${wsclose.number_of(k.code)}")
+                None    => println("no close")
+
+fn wait_for_close(c: WsConn, t: WsTcp) -> ?WsClose [io, net, time]
+    match wsconn.pump(c, t, wsconn.now_ms())
+        Err(_)   => None
+        Ok(turn) =>
+            match wsconn.peer_close(turn.conn)
+                Some(k) => Some(k)
+                None    => wait_for_close(turn.conn, t)

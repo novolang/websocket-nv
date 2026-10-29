@@ -1,0 +1,637 @@
+// wscompress_tests.nv — permessage-deflate on a connection: what a
+// negotiated connection accepts, refuses and sends.
+//
+// The compressed messages the peer sends are written by CPython's zlib
+// (`tests/vectors.py`), so the connection is checked against an encoder it
+// shares nothing with. The messages the connection sends are inflated with
+// this package's decoder, which `wsdeflate_tests.nv` checks against zlib's
+// streams.
+
+use std.test
+use std.bytes
+use wsconn
+use wsconnerr
+use wsclose
+use wstrans
+use wsdeflate
+
+// ── The script: a transport that reads from memory ──────────────────
+//
+// `g_in` is what the peer sends, one chunk for each time the connection
+// reads. When it runs out the transport answers a receive deadline, or the
+// close of the TCP connection if `g_eof` is set. `g_out` collects what the
+// connection sends. Nothing here touches a socket or a clock.
+
+var g_in: [[u8]] = []
+var g_at         = 0
+var g_out: [u8]  = []
+var g_eof        = false
+
+// When set, the first read answers with the 101 for the key the connection
+// sent, followed by `g_extra` header lines and then `g_tail` as frames.
+var g_reply      = false
+var g_replied    = false
+var g_extra      = ""
+var g_tail: [u8] = []
+
+// When above zero, a write takes at most this many bytes.
+var g_limit = 0
+
+struct Wire
+    tag: Int
+
+impl WsTransport[mutate] for Wire
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError> [mutate]
+        var n = bytes.len(data)
+        if g_limit > 0 and n > g_limit
+            n = g_limit
+        list.append(g_out, bytes.to_byte_list(bytes.slice(data, 0, n)))
+        Ok(n)
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError> [mutate]
+        if g_reply and not g_replied
+            g_replied = true
+            Ok(bytes.from_byte_list(joined([str_bytes(upgrade_answer()), g_tail])))
+        else if g_at < list.len(g_in)
+            let chunk = g_in[g_at]
+            g_at = g_at + 1
+            Ok(bytes.from_byte_list(chunk))
+        else if g_eof
+            Err(IoClosed)
+        else
+            Err(IoTimedOut)
+
+    fn ws_close(self) -> ?IoError [mutate]
+        None
+
+    fn ws_is_open(self) -> Bool
+        true
+
+fn load(chunks: [[u8]], eof: Bool)
+    g_in = chunks[:]
+    g_at = 0
+    g_out = []
+    g_eof = eof
+    g_reply = false
+    g_replied = false
+    g_extra = ""
+    g_tail = []
+    g_limit = 0
+
+// The key line the connection sent, without its name.
+fn key_sent() -> Str
+    let sent = text_of(g_out)
+    match str.index(sent, "Sec-WebSocket-Key: ")
+        None     => ""
+        Some(at) =>
+            let rest = str.slice(sent, at + 19, str.len(sent))
+            str.slice(rest, 0, str.index(rest, "\r\n") ?? 0)
+
+fn upgrade_answer() -> Str
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+        + wshandshake.accept_key(key_sent()) + "\r\n" + g_extra + "\r\n"
+
+fn wire() -> Wire
+    Wire { tag: 0 }
+
+fn hex(h: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(h) ?? bytes.zeros(0))
+
+fn tohex(b: [u8]) -> Str
+    bytes.to_hex(bytes.from_byte_list(b))
+
+fn text_of(b: [u8]) -> Str
+    bytes.to_str(bytes.from_byte_list(b))
+
+fn repeated(h: Str, n: Int) -> [u8]
+    var out: [u8] = []
+    var i = 0
+    while i < n
+        list.append(out, hex(h))
+        i = i + 1
+    out
+
+fn joined(parts: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for p in parts
+        list.append(out, p)
+    out
+
+// ── Frames the peer sends ───────────────────────────────────────────
+
+fn key4() -> [u8]
+    [0x37, 0xfa, 0x21, 0x3d]
+
+// A frame with first byte `b0`, masked with `key` unless `key` is empty.
+fn fr(b0: Int, payload: [u8], key: [u8]) -> [u8]
+    var out: [u8] = [b0 as u8]
+    let n = list.len(payload)
+    var mask_bit = 0
+    if list.len(key) > 0
+        mask_bit = 0x80
+    if n < 126
+        list.push(out, (mask_bit | n) as u8)
+    else if n < 65536
+        list.push(out, (mask_bit | 126) as u8)
+        list.push(out, (n >> 8) as u8)
+        list.push(out, (n & 255) as u8)
+    else
+        list.push(out, (mask_bit | 127) as u8)
+        var shift = 56
+        while shift >= 0
+            list.push(out, ((n >> shift) & 255) as u8)
+            shift = shift - 8
+    if list.len(key) > 0
+        list.append(out, key)
+        var i = 0
+        while i < n
+            list.push(out, (payload[i] as Int ^ key[i % 4] as Int) as u8)
+            i = i + 1
+    else
+        list.append(out, payload)
+    out
+
+// A frame from a client, masked.
+fn c(b0: Int, payload: [u8]) -> [u8]
+    fr(b0, payload, key4())
+
+// A frame from a server, unmasked.
+fn s(b0: Int, payload: [u8]) -> [u8]
+    fr(b0, payload, [])
+
+fn str_bytes(t: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(t))
+
+fn close_body(code: Int, reason: Str) -> [u8]
+    var out: [u8] = [(code >> 8) as u8, (code & 255) as u8]
+    list.append(out, str_bytes(reason))
+    out
+
+// ── What a connection sent, read back by an independent parser ──────
+
+// One frame per entry, as `kind[M][R]:payload`, where `M` marks a masked
+// frame and `R` one with RSV1 set. The payload is unmasked.
+fn frames_sent(buf: [u8]) -> [Str]
+    var out: [Str] = []
+    var at = 0
+    while at + 2 <= list.len(buf)
+        let b0 = buf[at] as Int
+        let b1 = buf[at + 1] as Int
+        let masked = (b1 & 0x80) != 0
+        var n = b1 & 0x7F
+        var p = at + 2
+        if n == 126
+            n = (buf[p] as Int << 8) | buf[p + 1] as Int
+            p = p + 2
+        else if n == 127
+            n = 0
+            var i = 0
+            while i < 8
+                n = (n << 8) | buf[p + i] as Int
+                i = i + 1
+            p = p + 8
+        var key: [u8] = [0, 0, 0, 0]
+        if masked
+            key = buf[p:p + 4]
+            p = p + 4
+        var payload: [u8] = []
+        var i = 0
+        while i < n
+            var b = buf[p + i] as Int
+            if masked
+                b = b ^ key[i % 4] as Int
+            list.push(payload, b as u8)
+            i = i + 1
+        var kind = "op${b0 & 15}"
+        let op = b0 & 15
+        if op == 1
+            kind = "text"
+        else if op == 2
+            kind = "bin"
+        else if op == 0
+            kind = "cont"
+        else if op == 8
+            kind = "close"
+        else if op == 9
+            kind = "ping"
+        else if op == 10
+            kind = "pong"
+        if (b0 & 0x80) == 0
+            kind = kind + "-"
+        if masked
+            kind = kind + "M"
+        if (b0 & 0x40) != 0
+            kind = kind + "R"
+        var shown = tohex(payload)
+        if op == 1
+            shown = text_of(payload)
+        if op == 8
+            shown = "none"
+            if n >= 2
+                shown = "${(payload[0] as Int << 8) | payload[1] as Int}"
+        if n > 40 and op != 8
+            shown = "#${n}"
+        list.push(out, kind + ":" + shown)
+        at = p + n
+    out
+
+fn event_text(ev: WsConnEvent) -> Str
+    match ev
+        WsMessageReceived(msg) =>
+            match msg
+                TextMessage(b)   =>
+                    if list.len(b) > 40
+                        "T#${list.len(b)}"
+                    else
+                        "T:" + text_of(b)
+                BinaryMessage(b) =>
+                    if list.len(b) > 40
+                        "B#${list.len(b)}"
+                    else
+                        "B:" + tohex(b)
+        WsFragmentReceived(f)  => "F${f.header.fin}:${tohex(f.payload)}"
+        WsPingAnswered(p)      => "ping:" + tohex(p)
+        WsPongReceived(ms)     => "pong@${ms}"
+        WsCloseReceived(k)     => "close:${wsclose.number_of(k.code)}"
+        WsCloseCompleted       => "done"
+
+fn fault_text(f: ?WsConnError) -> Str
+    match f
+        None    => "-"
+        Some(e) =>
+            match wsconnerr.close_code_for(e)
+                Some(code) => "err:${wsclose.number_of(code)}"
+                None       => "err:none"
+
+// Everything one run of the script taught.
+struct Run
+    events: Str
+    sent: Str
+    fault: Str
+    conn: WsConn
+
+// Pump once for each chunk and once more, stopping at the first fault.
+fn drive_at(conn: WsConn, chunks: [[u8]], eof: Bool, now: Int) -> Run [mutate]
+    load(chunks, eof)
+    var cur = conn
+    var events: [Str] = []
+    var fault: ?WsConnError = None
+    var turns = 0
+    while turns <= list.len(chunks) and fault == None
+        match wsconn.pump(cur, wire(), now)
+            Err(e)   =>
+                fault = Some(e)
+            Ok(turn) =>
+                cur = turn.conn
+                for ev in turn.events
+                    list.push(events, event_text(ev))
+        turns = turns + 1
+    Run { events: str.join(events, "|"), sent: str.join(frames_sent(g_out), "|"),
+          fault: fault_text(fault), conn: cur }
+
+fn drive(conn: WsConn, chunks: [[u8]]) -> Run [mutate]
+    drive_at(conn, chunks, false, 0)
+
+fn server() -> WsConn
+    wsconn.connection(ServerSide, wsconn.quiet_options(), WsDeflateOff, None)
+
+fn client() -> WsConn
+    wsconn.connection(ClientSide, wsconn.quiet_options(), WsDeflateOff, None)
+
+// What a script is expected to teach, in one assertion.
+fn expect(r: Run, events: Str, sent: Str, fault: Str)
+    test.assert_eq(r.events, events)
+    test.assert_eq(r.sent, sent)
+    test.assert_eq(r.fault, fault)
+
+// A transport that reports itself closed, and refuses every write.
+struct Shut
+    tag: Int
+
+impl WsTransport[] for Shut
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError>
+        Err(IoBrokenPipe)
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError>
+        Ok(bytes.zeros(0))
+
+    fn ws_close(self) -> ?IoError
+        None
+
+    fn ws_is_open(self) -> Bool
+        false
+
+// ── Connections that negotiated the extension ───────────────────────
+
+fn on(client_resets: Bool, server_resets: Bool) -> WsDeflateState
+    WsDeflateOn(WsDeflateParams {
+        server_no_context_takeover: server_resets, client_no_context_takeover: client_resets,
+        server_max_window_bits: 15, client_max_window_bits: 15 })
+
+fn opts(max_message: Int, max_send: Int, compress: Bool) -> WsConnOptions
+    WsConnOptions {
+        limits: WsLimits { max_frame: 1048576, max_message: max_message }, close_timeout_ms: 5000,
+        pong_timeout_ms: 0, ping_interval_ms: 0, max_send_frame: max_send, compress_outgoing: compress }
+
+fn server_with(state: WsDeflateState) -> WsConn
+    wsconn.connection(ServerSide, opts(1048576, 65536, true), state, None)
+
+fn client_with(state: WsDeflateState) -> WsConn
+    wsconn.connection(ClientSide, opts(1048576, 65536, true), state, None)
+
+fn packed(h: Str) -> [u8]
+    hex(h)
+
+// ── Receiving ───────────────────────────────────────────────────────
+
+@test
+fn test_a_compressed_message_is_inflated_before_it_is_reported() [mutate]
+    let conn = server_with(on(true, true))
+
+    test.case("a text message")
+    expect(drive(conn, [c(0xc1, packed(vec_hello_packed()))]), "T:Hello", "", "-")
+
+    test.case("an empty one, which is the single byte 00")
+    expect(drive(conn, [c(0xc1, packed(vec_empty_packed()))]), "T:", "", "-")
+
+    test.case("a binary message that zlib stored whole")
+    expect(drive(conn, [c(0xc2, packed(vec_noise1000_packed()))]), "B#1000", "", "-")
+
+    test.case("a message that is not compressed has RSV1 clear and passes as it is")
+    expect(drive(conn, [c(0x81, str_bytes("plain"))]), "T:plain", "", "-")
+
+    test.case("a stream the peer ended with BFINAL")
+    expect(drive(conn, [c(0xc1, packed(vec_final_packed()))]), "T:Hello", "", "-")
+
+@test
+fn test_a_compressed_message_may_be_fragmented() [mutate]
+    let conn = server_with(on(true, true))
+    let whole = packed(vec_text300_packed())
+    let cut = list.len(whole) / 2
+    let first = whole[0:cut]
+    let rest = whole[cut:list.len(whole)]
+
+    test.case("RSV1 is on the first frame only")
+    expect(drive(conn, [joined([c(0x41, first), c(0x80, rest)])]), "T#300", "", "-")
+
+    test.case("in separate writes with a ping between")
+    expect(drive(conn, [c(0x41, first), c(0x89, []), c(0x80, rest)]), "ping:|T#300", "pong:", "-")
+
+    test.case("a plain message after a compressed one is not inflated")
+    expect(drive(conn, [joined([c(0xc1, packed(vec_hello_packed())), c(0x81, str_bytes("plain"))])]),
+           "T:Hello|T:plain", "", "-")
+
+@test
+fn test_rsv1_anywhere_but_the_first_data_frame_fails_the_connection() [mutate]
+    let conn = server_with(on(true, true))
+    test.case("on a continuation")
+    expect(drive(conn, [joined([c(0x41, packed(vec_hello_packed())), c(0xc0, [])])]),
+        "",
+        "close:1002",
+        "err:1002")
+
+    test.case("on a ping")
+    expect(drive(conn, [c(0xc9, [])]), "", "close:1002", "err:1002")
+
+    test.case("on a close")
+    expect(drive(conn, [c(0xc8, close_body(1000, ""))]), "", "close:1002", "err:1002")
+
+    test.case("RSV2 is still refused")
+    expect(drive(conn, [c(0xa1, str_bytes("x"))]), "", "close:1002", "err:1002")
+
+@test
+fn test_a_peer_that_keeps_its_window_is_read_across_messages() [mutate]
+    let events = "T:Hello Hello Hello Hello|T:Hello Hello again Hello|T:Hello"
+    let seq = [c(0xc1, packed(vec_seq0_packed())),
+        c(0xc1, packed(vec_seq1_packed())),
+        c(0xc1, packed(vec_seq2_packed()))]
+
+    test.case("a client that did not drop its window, read by a server")
+    expect(drive(server_with(on(false, true)), seq), events, "", "-")
+
+    test.case("a server that did not drop its window, read by a client")
+    let from_server = [s(0xc1, packed(vec_seq0_packed())), s(0xc1, packed(vec_seq1_packed())),
+                       s(0xc1, packed(vec_seq2_packed()))]
+    expect(drive(client_with(on(true, false)), from_server), events, "", "-")
+
+    test.case("a peer that said it drops its window cannot refer to the one before")
+    expect(drive(server_with(on(true, true)), seq), "T:Hello Hello Hello Hello", "close:1007", "err:1007")
+
+@test
+fn test_what_inflates_wrongly_or_too_large_or_to_bad_text_fails_the_connection() [mutate]
+    test.case("a stream that is not DEFLATE")
+    expect(drive(server_with(on(true, true)), [c(0xc1, [0x07])]), "", "close:1007", "err:1007")
+
+    test.case("a message that inflates past the limit: 1009")
+    let limited = wsconn.connection(ServerSide, opts(1000, 65536, true), on(true, true), None)
+    expect(drive(limited, [c(0xc1, packed(vec_text5000_packed()))]), "", "close:1009", "err:1009")
+
+    test.case("inflated text that is not UTF-8: 1007")
+    expect(drive(server_with(on(true, true)), [c(0xc1, packed(vec_noise1000_packed()))]),
+        "",
+        "close:1007",
+        "err:1007")
+
+@test
+fn test_with_reassembly_off_each_compressed_fragment_is_inflated_in_turn() [mutate]
+    let stream = wsconn.connection(ServerSide, opts(0, 65536, true), on(true, true), None)
+    let whole = packed(vec_text300_packed())
+    let cut = list.len(whole) / 2
+    let r = drive(stream, [c(0x41, whole[0:cut]), c(0x80, whole[cut:list.len(whole)])])
+    test.assert_eq(r.fault, "-")
+    let parts = str.split(r.events, "|")
+    test.assert_eq(list.len(parts), 2)
+    test.assert(str.starts_with(parts[0], "Ffalse:"))
+    test.assert(str.starts_with(parts[1], "Ftrue:"))
+    let joined_hex = str.slice(parts[0], 7, str.len(parts[0])) + str.slice(parts[1], 6, str.len(parts[1]))
+    test.assert_eq(joined_hex, vec_text300_plain())
+
+    test.case("a corrupt fragment fails the connection")
+    expect(drive(stream, [c(0x41, [0x07])]), "", "close:1007", "err:1007")
+
+    test.case("an uncompressed fragment passes")
+    expect(drive(stream, [c(0x01, str_bytes("ab"))]), "Ffalse:6162", "", "-")
+
+// ── Sending ─────────────────────────────────────────────────────────
+
+fn sent_payload(first: Int) -> [u8]
+    // The payload of the first frame in what was sent, whichever length
+    // form its header uses, unmasked on the way.
+    var at = 2
+    let n = g_out[1] as Int & 0x7F
+    var len = n
+    if n == 126
+        len = (g_out[2] as Int << 8) | g_out[3] as Int
+        at = 4
+    var out: [u8] = []
+    var i = 0
+    while i < len
+        list.push(out, g_out[at + i])
+        i = i + 1
+    out
+
+@test
+fn test_a_long_message_is_sent_compressed_with_rsv1_on_the_first_frame() [mutate]
+    let plain = repeated("61626364", 100)
+    load([], false)
+    match wsconn.send_text(server_with(on(true, true)), wire(), plain, 0)
+        Err(_) => test.assert(false)
+        Ok(_)  =>
+            test.assert(str.starts_with(str.join(frames_sent(g_out), "|"), "textR:"))
+            match wsdeflate.decompress(bytes.from_byte_list(sent_payload(0)), wsdeflate.default_params(), true, 0)
+                Err(_)  => test.assert(false)
+                Ok(out) => test.assert(out == bytes.from_byte_list(plain))
+
+    test.case("a client's frame is masked and compressed")
+    load([], false)
+    match wsconn.send_binary(client_with(on(true, true)), wire(), plain, 0)
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(str.starts_with(str.join(frames_sent(g_out), "|"), "binMR:"))
+
+    test.case("a message under the threshold goes as it is")
+    load([], false)
+    match wsconn.send_text(server_with(on(true, true)), wire(), str_bytes("short"), 0)
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert_eq(str.join(frames_sent(g_out), "|"), "text:short")
+
+    test.case("and so does everything when compressing is off")
+    load([], false)
+    let off = wsconn.connection(ServerSide, opts(1048576, 65536, false), on(true, true), None)
+    match wsconn.send_text(off, wire(), plain, 0)
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert_eq(str.join(frames_sent(g_out), "|"), "text:#400")
+
+    test.case("a connection that negotiated nothing never sets RSV1")
+    load([], false)
+    match wsconn.send_text(server(), wire(), plain, 0)
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert_eq(str.join(frames_sent(g_out), "|"), "text:#400")
+
+@test
+fn test_a_compressed_message_cut_into_frames_has_rsv1_on_the_first_only() [mutate]
+    let plain = hex(vec_text5000_plain())
+    load([], false)
+    let small = wsconn.connection(ServerSide, opts(1048576, 8, true), on(true, true), None)
+    match wsconn.send_binary(small, wire(), plain, 0)
+        Err(_) => test.assert(false)
+        Ok(_)  =>
+            let shown = frames_sent(g_out)
+            test.assert(list.len(shown) > 1)
+            test.assert(str.starts_with(shown[0], "bin-R:"))
+            var rest_clean = true
+            var i = 1
+            while i < list.len(shown)
+                if not str.starts_with(shown[i], "cont")
+                    rest_clean = false
+                if str.contains(shown[i], "R:") or str.contains(shown[i], "R-:")
+                    rest_clean = false
+                i = i + 1
+            test.assert(rest_clean)
+
+@test
+fn test_two_connections_that_negotiated_the_extension_understand_each_other() [mutate]
+    let plain = repeated("6162636465666768", 200)
+    load([], false)
+    match wsconn.send_binary(client_with(on(true, true)), wire(), plain, 0)
+        Err(_) => test.assert(false)
+        Ok(_)  =>
+            let got = drive(server_with(on(true, true)), [g_out[:]])
+            expect(got, "B#1600", "", "-")
+
+            test.case("and the other way")
+            load([], false)
+            match wsconn.send_text(got.conn, wire(), repeated("62", 300), 0)
+                Err(_) => test.assert(false)
+                Ok(_)  => expect(drive(client_with(on(true, true)), [g_out[:]]), "T#300", "", "-")
+
+// ── A frame that has not all arrived ────────────────────────────────
+
+@test
+fn test_a_partial_frame_is_waited_for_unless_it_declares_too_much() [mutate]
+    let tight = wsconn.connection(ServerSide, opts(3000, 65536, true), on(true, true), None)
+    let roomy = server_with(on(true, true))
+
+    test.case("one byte, or part of the length field")
+    expect(drive(tight, [hex("82")]), "", "", "-")
+    expect(drive(tight, [hex("8285")]), "", "", "-")
+    expect(drive(tight, [hex("82fe")]), "", "", "-")
+    expect(drive(tight, [hex("82fe0f")]), "", "", "-")
+    expect(drive(tight, [hex("82ff0000")]), "", "", "-")
+
+    test.case("a length field that fits the limit, and a frame that has not all come")
+    expect(drive(roomy, [hex("82fe0fa0")]), "", "", "-")
+    expect(drive(roomy, [hex("82ff0000000000010000")]), "", "", "-")
+
+    test.case("a 16-bit length over the frame limit is refused as soon as it is known")
+    let small = wsconn.connection(ServerSide, WsConnOptions {
+        limits: WsLimits { max_frame: 1000, max_message: 3000 }, close_timeout_ms: 5000,
+        pong_timeout_ms: 0, ping_interval_ms: 0, max_send_frame: 65536, compress_outgoing: true },
+        on(true, true), None)
+    expect(drive(small, [hex("82fe0fa0")]), "", "close:1009", "err:1009")
+
+    test.case("and so is a 64-bit one")
+    expect(drive(small, [hex("82ff000000003b9aca00")]), "", "close:1009", "err:1009")
+
+    test.case("a 64-bit length with its top bit set can never be held, and is waited on")
+    expect(drive(small, [hex("82ff8000000000000000")]), "", "", "-")
+
+// BEGIN VECTORS
+
+fn vec_hello_packed() -> Str
+    "f248cdc9c90700"
+
+fn vec_hello_plain() -> Str
+    "48656c6c6f"
+
+fn vec_empty_packed() -> Str
+    "00"
+
+fn vec_empty_plain() -> Str
+    ""
+
+fn vec_text300_packed() -> Str
+    "4a4fcccd4d54484a2d4954482d28ceccc9cf83704a32d049104e49cd2949445690985390019142f0a0caa1a62169a942a8c12411c6235441f8c88e8088542198c84a6056220c045b9b0ef6228aefaa503d049383d1080f23fb280500"
+
+fn vec_text300_plain() -> Str
+    "67616d6d61206265746120657073696c6f6e2062657461207468657461207468657461207468657461206574612064656c7461206265746120746865746120616c706861206574612065746120616c70686120746865746120657073696c6f6e2064656c74612062657461207a65746120616c70686120616c70686120616c70686120616c706861206574612064656c74612065746120616c7068612064656c74612074686574612074686574612064656c7461207a6574612064656c74612064656c746120746865746120657073696c6f6e20616c7068612065746120626574612067616d6d6120657073696c6f6e2062657461207a657461206574612064656c746120657073696c6f6e20657073696c6f6e2074686574612065746120616c7068612074686574612064"
+
+fn vec_text5000_packed() -> Str
+    "7c585b72c2300cbc0a578ba74ce90cb4cc345f3e7d294ea27d391f0de0d896b45aade52ef7e76db9b4ebba3dfaffe373793c96cbf5f9fb75fff93e3e3faef7d7bbe5bd609bb18ebff7a2f5f6feb94d1ed3c6135ef77d499919cfb1b99be83a1106368bfbb65d5c291fc7efb139bb095e8daf9381b13680c3db1d9f3086663be33c021d135a0d8c27af6f6eda21d32d0a11047991949b6558bcdbc20c8ca75a1c7be33bd8a6e15e002e479ac634db804617e773d621fc3e4b15128ecde31b7c36a506828019a7c89b5029d125f842e5522903289a4601efd03fa4341a47bf7773c4c535040e14ae7c50923926265c52152240ac40089437ef139c336b54248e414f9748637405fd66704d8ec84f4ac7496248eee06d7210599a4a5cb49d0949258428c87ebdd6258540d0c5310c59b9350351bf03fd4a03e61436310726970bb512d2eb6122abb448d9eb33d5c228b5a2d201a55506c72f59c314cf6895640ead74c6857249d3132b5de8e30fc99a24852bdbeb98df83a430338520da85381fe7e1b1dd2efeba877ae878a743dc5ea3782aac8660aa56237b135794b84a2a38af9912505a01a702db4e3f0c3b3415169a2a8cf73965cccfe7c3f5c47a61c355f655ec6aba1613f7bf56a4a633e2db59c7a3e17b65274aa3a280dab850798766c8a25d3361bc3f6d85086ac3030d4dca8cc13e630ce6497a3c1e8d9ae3fd5b4d9bb787088ca166ddfda48164bf429b50b459f3013955cd281b1abf0ba1f448e9ecf32b95bb6c0ca27c7336709d9313f074a1c4465bc8cad58fe6a592029e1ee7fcfa45d7da702f0b19de678bbcc8af60cb2e71daa8b31f2e2b0adafc68f5eed60f32508cd46056696a15cb3d6fd68988644b18b9c227b750d9192074d8fcaa0b2b3944a76b5598386e9daadf6a0e2a87fb110ba2026ab7b2dc07e2a8b528a96cbcd9c4d2d05edf7d978612422100b374bbe64cf424dcbb04f1a012513af4bf26f9acf20b45b4aff144305e7bff01"
+
+fn vec_text5000_plain() -> Str
+    "616c70686120626574612062657461207a6574612067616d6d6120657073696c6f6e20657073696c6f6e2064656c746120616c7068612067616d6d612065746120657461207a65746120746865746120657073696c6f6e20616c70686120616c706861207a657461207468657461207a65746120657461206574612067616d6d612067616d6d612064656c74612064656c746120616c7068612067616d6d61207a6574612067616d6d612067616d6d61207a6574612067616d6d6120746865746120657461207a657461207a657461207a6574612074686574612067616d6d61206574612074686574612064656c746120746865746120657073696c6f6e207468657461207a657461207468657461207468657461207a6574612074686574612074686574612064656c7461207a6574612067616d6d6120657073696c6f6e20746865746120657073696c6f6e20657073696c6f6e2065746120657073696c6f6e2064656c7461207468657461207a6574612062657461207a65746120616c7068612064656c7461206265746120616c70686120616c70686120657073696c6f6e2064656c746120626574612067616d6d6120657073696c6f6e2064656c74612064656c746120616c7068612065746120616c70686120616c706861207a657461207a6574612067616d6d612064656c746120616c70686120626574612062657461206265746120616c70686120616c70686120616c706861207a65746120657073696c6f6e2067616d6d612067616d6d612067616d6d6120616c7068612065746120616c7068612064656c74612067616d6d6120616c70686120616c706861207a657461206265746120657073696c6f6e207a65746120746865746120616c70686120657073696c6f6e20746865746120616c70686120657073696c6f6e206574612067616d6d612074686574612064656c74612062657461207a657461206265746120616c7068612074686574612067616d6d6120657461207468657461207a6574612067616d6d61207a65746120657073696c6f6e20657073696c6f6e2065746120616c7068612067616d6d6120616c70686120657073696c6f6e20616c7068612067616d6d612067616d6d612067616d6d6120626574612074686574612064656c746120616c7068612064656c74612064656c7461207468657461206265746120657073696c6f6e20626574612064656c7461207a65746120657073696c6f6e2065746120657073696c6f6e20616c7068612067616d6d6120616c70686120657461206574612067616d6d61206265746120626574612064656c74612062657461206265746120616c7068612067616d6d612064656c746120626574612064656c746120616c70686120746865746120746865746120657073696c6f6e206574612064656c74612064656c7461206574612065746120616c70686120616c706861206574612067616d6d612062657461207468657461207a65746120616c7068612062657461207a65746120657073696c6f6e207a65746120657073696c6f6e20616c706861206574612062657461206265746120657073696c6f6e2064656c746120616c70686120746865746120616c706861206574612074686574612074686574612064656c7461206265746120616c70686120657073696c6f6e20616c706861207a65746120657073696c6f6e20626574612064656c74612074686574612064656c74612062657461207a657461206574612074686574612067616d6d61207a65746120657461206265746120657073696c6f6e206265746120626574612062657461207a657461206574612064656c7461206265746120616c70686120746865746120616c70686120746865746120657073696c6f6e207a6574612074686574612067616d6d61207a65746120657073696c6f6e2074686574612074686574612065746120746865746120657073696c6f6e206574612064656c74612067616d6d6120746865746120657073696c6f6e20657461206265746120626574612062657461207a6574612067616d6d612067616d6d61206574612062657461206265746120616c7068612067616d6d6120657073696c6f6e206574612064656c7461207a6574612074686574612067616d6d6120657073696c6f6e20626574612067616d6d61206574612062657461207a6574612064656c746120657073696c6f6e2067616d6d612067616d6d612074686574612064656c746120657461207a6574612067616d6d6120746865746120746865746120616c706861206574612067616d6d612065746120616c70686120746865746120657073696c6f6e2065746120657073696c6f6e20657461207468657461207a657461207a65746120626574612064656c74612064656c7461206574612065746120616c706861207a6574612074686574612074686574612067616d6d61206265746120616c706861206574612064656c7461206574612064656c74612062657461206574612064656c746120657073696c6f6e2064656c74612074686574612067616d6d6120616c7068612065746120746865746120657073696c6f6e2067616d6d612074686574612064656c74612062657461207a65746120616c7068612074686574612062657461207468657461207a65746120746865746120657073696c6f6e20746865746120616c7068612062657461207a6574612067616d6d612065746120657073696c6f6e2067616d6d6120616c7068612067616d6d612074686574612065746120746865746120657073696c6f6e2067616d6d6120616c70686120657073696c6f6e20746865746120616c706861207a65746120616c706861206574612074686574612064656c746120657073696c6f6e2074686574612067616d6d6120746865746120657073696c6f6e206265746120657073696c6f6e207a65746120657073696c6f6e207a65746120657073696c6f6e2065746120626574612064656c7461206574612067616d6d61206265746120657073696c6f6e20616c7068612064656c74612074686574612064656c746120657073696c6f6e20616c7068612062657461206265746120657461207a6574612064656c7461207a657461207a6574612062657461207a657461207468657461207a6574612067616d6d6120746865746120746865746120657073696c6f6e2074686574612067616d6d612074686574612064656c746120657073696c6f6e207a6574612067616d6d6120626574612064656c74612074686574612064656c7461207a6574612067616d6d61207a6574612067616d6d612067616d6d612064656c746120657073696c6f6e2065746120657461207a65746120657073696c6f6e207a6574612065746120657073696c6f6e2062657461207a65746120657073696c6f6e206574612074686574612067616d6d6120657073696c6f6e207a65746120746865746120746865746120626574612067616d6d61207a657461206574612067616d6d6120616c7068612062657461207a6574612067616d6d61207a65746120626574612065746120616c706861207a6574612064656c74612065746120657073696c6f6e2074686574612067616d6d61207a657461207a6574612064656c746120746865746120626574612067616d6d612064656c7461207a65746120657073696c6f6e2067616d6d6120657461207a65746120657073696c6f6e2062657461207a6574612064656c74612064656c74612064656c746120616c706861207a657461207a65746120616c7068612067616d6d612067616d6d6120626574612065746120746865746120657073696c6f6e2067616d6d61207a6574612062657461207a657461206574612064656c746120616c70686120657461207468657461207468657461207a6574612062657461207468657461206574612074686574612067616d6d61206574612065746120746865746120616c70686120626574612074686574612067616d6d6120626574612067616d6d6120626574612065746120657073696c6f6e20746865746120616c70686120657073696c6f6e2062657461207a6574612064656c74612067616d6d6120616c7068612067616d6d61206574612062657461207a65746120746865746120616c7068612074686574612064656c746120626574612074686574612067616d6d6120616c7068612067616d6d6120616c70686120616c7068612064656c746120616c706861207a6574612064656c74612067616d6d61207a65746120746865746120616c7068612067616d6d6120626574612064656c746120626574612074686574612064656c746120616c7068612064656c746120657461207a657461206574612067616d6d6120626574612067616d6d612064656c74612067616d6d61206574612064656c746120657073696c6f6e207a657461206574612067616d6d61206574612067616d6d6120657461207a65746120657073696c6f6e2062657461206265746120746865746120657073696c6f6e20657073696c6f6e20746865746120657073696c6f6e2064656c7461206574612067616d6d61206265746120616c7068612064656c74612064656c74612064656c74612065746120616c7068612067616d6d6120616c70686120657073696c6f6e20746865746120616c7068612064656c74612067616d6d61207a65746120616c7068612064656c746120626574612067616d6d612067616d6d61206265746120746865746120657073696c6f6e2064656c74612067616d6d61207a65746120657073696c6f6e2062657461206574612065746120616c70686120746865746120657073696c6f6e206265746120657073696c6f6e20616c7068612064656c746120657461207a65746120657073696c6f6e206574612064656c7461206574612067616d6d612067616d6d61207468657461207468657461207a6574612065746120746865746120657073696c6f6e2064656c74612074686574612074686574612064656c7461207468657461207a65746120657073696c6f6e20626574612067616d6d61207a6574612074686574612064656c74612067616d6d6120657073696c6f6e2064656c746120657073696c6f6e206265746120616c70686120616c7068612064656c7461207a65746120616c706861207a65746120657073696c6f6e207a65746120746865746120626574612065746120746865746120616c70686120657073696c6f6e2067616d6d612064656c74612067616d6d612067616d6d6120657461206265746120746865746120657073696c6f6e20626574612074686574612074686574612064656c74612067616d6d6120657073696c6f6e2064656c74612064656c7461207a65746120657461206574612064656c74612064656c746120616c70686120657073696c6f6e2064656c74612067616d6d612065746120657461206265746120746865746120657461206574612074686574612065746120657073696c6f6e2064656c74612064656c74612064656c746120616c706861206265746120616c70686120616c7068612065746120657461206574612064656c746120657073696c6f6e2062657461207a657461207a65746120746865746120626574612074686574612064656c746120657073696c6f6e20616c70686120616c70686120746865746120616c7068612067616d6d612067616d6d612064656c7461207a6574612064656c746120616c7068612067616d6d6120657073696c6f6e206265746120626574612067616d6d61206574612067616d6d6120616c70686120657073696c6f6e20657073696c6f6e20746865746120616c706861207a657461207a6574612062657461207a6574612062657461207a657461207a65746120657073696c6f6e20746865746120657073696c6f6e2067616d6d6120616c70686120616c706861207a6574612065746120616c706861207a65746120616c70686120626574612065746120657461206574612064656c74612067616d6d612067616d6d6120616c70686120616c706861207a6574612067616d6d6120657073696c6f6e20616c70686120616c7068612064656c74612064656c7461206574612062657461207a657461206265746120626574612064656c74612064656c74612064656c7461206265746120616c70686120657461206265746120657073696c6f6e2064656c746120616c70686120657461206574612067616d6d612067616d6d61206574612067616d6d61207468657461207a65746120616c7068612067616d6d61207468657461206574612074686574612067616d6d612074686574612067616d6d61207a6574612067616d6d6120616c70686120657073696c6f6e2067616d6d612067616d6d612065746120657073696c6f6e2074686574612074686574612074686574612064656c7461206574612065746120657073696c6f6e2064656c7461207a65746120616c7068612065746120616c7068612065746120657073696c6f6e20616c70686120746865746120657073696c6f6e20657073696c6f6e2064656c7461207468657461207468657461207a6574612074686574612064656c74612067616d6d6120746865746120657073696c6f6e207a6574612065746120626574612064656c746120657461206265746120657461207468657461207468657461206265746120657461207468657461207a657461207a6574612067616d6d612067616d6d612064656c74612067616d6d61206574612074686574612074686574612067616d6d612065746120657073696c6f6e207a6574612065746120657073696c6f6e20657073696c6f6e207a65746120616c7068612065746120616c7068612064656c"
+
+fn vec_noise1000_packed() -> Str
+    "00e80317fc7942bdf22106f0847762f0f3cb4d764dc7072051159a0f89f2c6dacae344bb311245fd6f84df9ad7c5b3d076ac0e8f53a7356c88913f20f6f72db022d24d0a96dad43c1617c1a98e78129e0327371065d095864f15ada0b846c1c0ebc5348adc799adf849bad05d4a10ac0441eaaeeb4b48efa0b1f0abd80e998a35aba5ea0bd8799c1350d439e71897aa75fde3134a4aa72e05628ac6fe68a733d1161a15d8eae2bb042d7958aedb1d594d6d112d34f6602f4de7110e993ae7422923d7d171165dc1906f63d57997a0ad31b3aae4081f41fb471653e3d577a8c4103f9cc198a7f89d81af2a5001c40173f1923f7102cfaa150a124b3c5c79bb88761a8db3f4101c2285b15bfebc216dc1bbefea1d7d6eb097d6f8a24d972da420ea6bf863eed3fc037a33402f24978c7162f32c05b0cae3e0d3af691992d127a36331fa65c277b5c7fe8c981bccbb3d62ac078d352d4f74fcd4c5331fef7e25f4588654ba17697d3886f9d0b89f5c36658b87aa4f749d6f569ef0ef625cc17ef7578236f827b6184465f12825617a05dd82e2b3c2f879512b6e7ac030faba9dfc2f8276bfac840a33d8c27dd39e08031bfbce6978736ad3afcb41e965d4c5bbde83f3748a9d7995feaf69f5a23365cc8b733888ac41b4515f58a7eb5aacee523b4fe394d8a3339395e60d5c8414acb63575b6780bd960fe3d0c4a19efe99f70f61013777fb58eb65636c12e339914e45ef2d190db87727ff09ada5a8b044291128af692066df71f8a13715d1276652c8fef222d86afa9b0bedeacde05ce91383bbbde5b9cd72016b84bd49eb63516b0b57ce560e473856e2fb5e1e0bcee5a2d0101a7ace14cbfc0d707b30c7f26154aa3bb13f1a948cee99fa7f880facb0a22f1dde2d01350f2e095712f61b60a966f4aef5b311c39cc92c965ed33ac7abce59c5b75eb9d4e075e3f6b08956c6f9154e570bef2f31a3791c18e6eeaabd002463cc35ad9f38e6296b7b184e49053975936a70d6a360ef5a2815390c3366822b37eecc7237f8b1cee43895e3c2693b03ed9927aeb162f824bad8226d7fb31fab78dce02b806fa554696fedd6bc61d1f7d0f01195095e310e4d961ff114636a8dfbdd13b0ef64934934e399d2e327694ef991c0be52dc9fedf271b893920fedbfb7987c0507434c0a54190068eeb5b911fa5e7a068dddad1a30e69f867effd685ad160fdb13547e45d3ac448f08561708f81eebefd4bd57965d254734d0b4e3e88e82e7904fa14713d2f876ea8b0fa23bf9408f8934de26be11f9e5639fb15cc4cba1198a6d13a2a2c8901243d580d328fd7566283a3f029023dc89f7ec8994185978f956494c5befcb0448c81b5c5a9f61424b184d6dc336ddc75d0d8f35433a4a9740c4b4276203bd48f47d20b5f800"
+
+fn vec_noise1000_plain() -> Str
+    "7942bdf22106f0847762f0f3cb4d764dc7072051159a0f89f2c6dacae344bb311245fd6f84df9ad7c5b3d076ac0e8f53a7356c88913f20f6f72db022d24d0a96dad43c1617c1a98e78129e0327371065d095864f15ada0b846c1c0ebc5348adc799adf849bad05d4a10ac0441eaaeeb4b48efa0b1f0abd80e998a35aba5ea0bd8799c1350d439e71897aa75fde3134a4aa72e05628ac6fe68a733d1161a15d8eae2bb042d7958aedb1d594d6d112d34f6602f4de7110e993ae7422923d7d171165dc1906f63d57997a0ad31b3aae4081f41fb471653e3d577a8c4103f9cc198a7f89d81af2a5001c40173f1923f7102cfaa150a124b3c5c79bb88761a8db3f4101c2285b15bfebc216dc1bbefea1d7d6eb097d6f8a24d972da420ea6bf863eed3fc037a33402f24978c7162f32c05b0cae3e0d3af691992d127a36331fa65c277b5c7fe8c981bccbb3d62ac078d352d4f74fcd4c5331fef7e25f4588654ba17697d3886f9d0b89f5c36658b87aa4f749d6f569ef0ef625cc17ef7578236f827b6184465f12825617a05dd82e2b3c2f879512b6e7ac030faba9dfc2f8276bfac840a33d8c27dd39e08031bfbce6978736ad3afcb41e965d4c5bbde83f3748a9d7995feaf69f5a23365cc8b733888ac41b4515f58a7eb5aacee523b4fe394d8a3339395e60d5c8414acb63575b6780bd960fe3d0c4a19efe99f70f61013777fb58eb65636c12e339914e45ef2d190db87727ff09ada5a8b044291128af692066df71f8a13715d1276652c8fef222d86afa9b0bedeacde05ce91383bbbde5b9cd72016b84bd49eb63516b0b57ce560e473856e2fb5e1e0bcee5a2d0101a7ace14cbfc0d707b30c7f26154aa3bb13f1a948cee99fa7f880facb0a22f1dde2d01350f2e095712f61b60a966f4aef5b311c39cc92c965ed33ac7abce59c5b75eb9d4e075e3f6b08956c6f9154e570bef2f31a3791c18e6eeaabd002463cc35ad9f38e6296b7b184e49053975936a70d6a360ef5a2815390c3366822b37eecc7237f8b1cee43895e3c2693b03ed9927aeb162f824bad8226d7fb31fab78dce02b806fa554696fedd6bc61d1f7d0f01195095e310e4d961ff114636a8dfbdd13b0ef64934934e399d2e327694ef991c0be52dc9fedf271b893920fedbfb7987c0507434c0a54190068eeb5b911fa5e7a068dddad1a30e69f867effd685ad160fdb13547e45d3ac448f08561708f81eebefd4bd57965d254734d0b4e3e88e82e7904fa14713d2f876ea8b0fa23bf9408f8934de26be11f9e5639fb15cc4cba1198a6d13a2a2c8901243d580d328fd7566283a3f029023dc89f7ec8994185978f956494c5befcb0448c81b5c5a9f61424b184d6dc336ddc75d0d8f35433a4a9740c4b4276203bd48f47d20b5f8"
+
+fn vec_seq0_packed() -> Str
+    "f248cdc9c957f040270100"
+
+fn vec_seq0_plain() -> Str
+    "48656c6c6f2048656c6c6f2048656c6c6f2048656c6c6f"
+
+fn vec_seq1_packed() -> Str
+    "4216484c4fcccc83b00100"
+
+fn vec_seq1_plain() -> Str
+    "48656c6c6f2048656c6c6f20616761696e2048656c6c6f"
+
+fn vec_seq2_packed() -> Str
+    "02130000"
+
+fn vec_seq2_plain() -> Str
+    "48656c6c6f"
+
+fn vec_final_packed() -> Str
+    "f348cdc9c90700"
+
+fn vec_final_plain() -> Str
+    "48656c6c6f"
+
+fn vec_cut_packed() -> Str
+    "4a4fcccd4d"
+
+// END VECTORS

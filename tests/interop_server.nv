@@ -1,0 +1,58 @@
+// interop_server.nv — an echo server for tests/interop.sh.
+//
+// It accepts connections on the port in INTEROP_PORT, upgrades each one with
+// permessage-deflate on offer, and sends every message back as it came.
+// After 8 connections it stops. A client from outside this package is what
+// reads the other end.
+
+use std.env
+use wsconn
+use wsserve
+use wstrans
+use wsdeflate
+
+fn echo(c: WsConn, t: WsTcp) [io, net, time]
+    var cur = c
+    var open = true
+    while open
+        match wsconn.pump(cur, t, wsconn.now_ms())
+            Err(_)   =>
+                open = false
+            Ok(turn) =>
+                cur = turn.conn
+                for ev in turn.events
+                    match ev
+                        WsMessageReceived(msg) =>
+                            cur = reply(cur, t, msg)
+                        _                      => ()
+                open = wsconn.can_receive(cur)
+    // The server closes the TCP connection first, as RFC 6455 section 7.1.1 asks.
+    let _ = t.ws_close()
+
+fn reply(c: WsConn, t: WsTcp, msg: WsMessage) -> WsConn [io, net, time]
+    let sent = match msg
+        TextMessage(b)   => wsconn.send_text(c, t, b, wsconn.now_ms())
+        BinaryMessage(b) => wsconn.send_binary(c, t, b, wsconn.now_ms())
+    match sent
+        Ok(turn) => turn.conn
+        Err(_)   => c
+
+fn main() [io, net, time]
+    let port = str.to_int(env.get("INTEROP_PORT") ?? "0") ?? 0
+    let policy = wsserve.with_deflate(wsserve.policy(), WsDeflateParams {
+        server_no_context_takeover: false, client_no_context_takeover: false,
+        server_max_window_bits: 15, client_max_window_bits: 15 })
+    match wstrans.listen("127.0.0.1", port)
+        Err(_) => println("listen failed")
+        Ok(l)  =>
+            println("listening")
+            var served = 0
+            while served < 8
+                match wstrans.accept(l)
+                    Err(_)  =>
+                        served = 8
+                    Ok(acc) =>
+                        match wsserve.accept_upgrade(acc.transport, policy)
+                            Err(_)   => println("refused")
+                            Ok(conn) => echo(conn, acc.transport)
+                        served = served + 1

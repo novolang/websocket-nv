@@ -1,0 +1,815 @@
+// wsproto_tests.nv — the conversations the Autobahn Testsuite holds with a
+// server, written as tables of bytes.
+//
+// A transport that hands back bytes from memory turns each conversation
+// into a value: the script says what the peer sends and when, and the
+// assertion says what the connection reported, what it sent, and which
+// fault ended it. The case numbers in the comments are Autobahn's. Cases
+// that differ only in a size or in a byte are one test with several
+// `test.case` lines.
+//
+// The frames the peer sends are built here, byte by byte, by a builder
+// that shares nothing with websocket-codec-nv, and the frames the
+// connection sends are read back by a second parser that does not either.
+// The first examples are the ones RFC 6455 section 5.7 prints.
+
+use std.test
+use std.bytes
+use wsconn
+use wsconnerr
+use wsclose
+use wstrans
+use wsdeflate
+
+// ── The script: a transport that reads from memory ──────────────────
+//
+// `g_in` is what the peer sends, one chunk for each time the connection
+// reads. When it runs out the transport answers a receive deadline, or the
+// close of the TCP connection if `g_eof` is set. `g_out` collects what the
+// connection sends. Nothing here touches a socket or a clock.
+
+var g_in: [[u8]] = []
+var g_at         = 0
+var g_out: [u8]  = []
+var g_eof        = false
+
+// When set, the first read answers with the 101 for the key the connection
+// sent, followed by `g_extra` header lines and then `g_tail` as frames.
+var g_reply      = false
+var g_replied    = false
+var g_extra      = ""
+var g_tail: [u8] = []
+
+// When above zero, a write takes at most this many bytes.
+var g_limit = 0
+
+struct Wire
+    tag: Int
+
+impl WsTransport[mutate] for Wire
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError> [mutate]
+        var n = bytes.len(data)
+        if g_limit > 0 and n > g_limit
+            n = g_limit
+        list.append(g_out, bytes.to_byte_list(bytes.slice(data, 0, n)))
+        Ok(n)
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError> [mutate]
+        if g_reply and not g_replied
+            g_replied = true
+            Ok(bytes.from_byte_list(joined([str_bytes(upgrade_answer()), g_tail])))
+        else if g_at < list.len(g_in)
+            let chunk = g_in[g_at]
+            g_at = g_at + 1
+            Ok(bytes.from_byte_list(chunk))
+        else if g_eof
+            Err(IoClosed)
+        else
+            Err(IoTimedOut)
+
+    fn ws_close(self) -> ?IoError [mutate]
+        None
+
+    fn ws_is_open(self) -> Bool
+        true
+
+fn load(chunks: [[u8]], eof: Bool)
+    g_in = chunks[:]
+    g_at = 0
+    g_out = []
+    g_eof = eof
+    g_reply = false
+    g_replied = false
+    g_extra = ""
+    g_tail = []
+    g_limit = 0
+
+// The key line the connection sent, without its name.
+fn key_sent() -> Str
+    let sent = text_of(g_out)
+    match str.index(sent, "Sec-WebSocket-Key: ")
+        None     => ""
+        Some(at) =>
+            let rest = str.slice(sent, at + 19, str.len(sent))
+            str.slice(rest, 0, str.index(rest, "\r\n") ?? 0)
+
+fn upgrade_answer() -> Str
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+        + wshandshake.accept_key(key_sent()) + "\r\n" + g_extra + "\r\n"
+
+fn wire() -> Wire
+    Wire { tag: 0 }
+
+fn hex(h: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(h) ?? bytes.zeros(0))
+
+fn tohex(b: [u8]) -> Str
+    bytes.to_hex(bytes.from_byte_list(b))
+
+fn text_of(b: [u8]) -> Str
+    bytes.to_str(bytes.from_byte_list(b))
+
+fn repeated(h: Str, n: Int) -> [u8]
+    var out: [u8] = []
+    var i = 0
+    while i < n
+        list.append(out, hex(h))
+        i = i + 1
+    out
+
+fn joined(parts: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for p in parts
+        list.append(out, p)
+    out
+
+// ── Frames the peer sends ───────────────────────────────────────────
+
+fn key4() -> [u8]
+    [0x37, 0xfa, 0x21, 0x3d]
+
+// A frame with first byte `b0`, masked with `key` unless `key` is empty.
+fn fr(b0: Int, payload: [u8], key: [u8]) -> [u8]
+    var out: [u8] = [b0 as u8]
+    let n = list.len(payload)
+    var mask_bit = 0
+    if list.len(key) > 0
+        mask_bit = 0x80
+    if n < 126
+        list.push(out, (mask_bit | n) as u8)
+    else if n < 65536
+        list.push(out, (mask_bit | 126) as u8)
+        list.push(out, (n >> 8) as u8)
+        list.push(out, (n & 255) as u8)
+    else
+        list.push(out, (mask_bit | 127) as u8)
+        var shift = 56
+        while shift >= 0
+            list.push(out, ((n >> shift) & 255) as u8)
+            shift = shift - 8
+    if list.len(key) > 0
+        list.append(out, key)
+        var i = 0
+        while i < n
+            list.push(out, (payload[i] as Int ^ key[i % 4] as Int) as u8)
+            i = i + 1
+    else
+        list.append(out, payload)
+    out
+
+// A frame from a client, masked.
+fn c(b0: Int, payload: [u8]) -> [u8]
+    fr(b0, payload, key4())
+
+// A frame from a server, unmasked.
+fn s(b0: Int, payload: [u8]) -> [u8]
+    fr(b0, payload, [])
+
+fn str_bytes(t: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(t))
+
+fn close_body(code: Int, reason: Str) -> [u8]
+    var out: [u8] = [(code >> 8) as u8, (code & 255) as u8]
+    list.append(out, str_bytes(reason))
+    out
+
+// ── What a connection sent, read back by an independent parser ──────
+
+// One frame per entry, as `kind[M][R]:payload`, where `M` marks a masked
+// frame and `R` one with RSV1 set. The payload is unmasked.
+fn frames_sent(buf: [u8]) -> [Str]
+    var out: [Str] = []
+    var at = 0
+    while at + 2 <= list.len(buf)
+        let b0 = buf[at] as Int
+        let b1 = buf[at + 1] as Int
+        let masked = (b1 & 0x80) != 0
+        var n = b1 & 0x7F
+        var p = at + 2
+        if n == 126
+            n = (buf[p] as Int << 8) | buf[p + 1] as Int
+            p = p + 2
+        else if n == 127
+            n = 0
+            var i = 0
+            while i < 8
+                n = (n << 8) | buf[p + i] as Int
+                i = i + 1
+            p = p + 8
+        var key: [u8] = [0, 0, 0, 0]
+        if masked
+            key = buf[p:p + 4]
+            p = p + 4
+        var payload: [u8] = []
+        var i = 0
+        while i < n
+            var b = buf[p + i] as Int
+            if masked
+                b = b ^ key[i % 4] as Int
+            list.push(payload, b as u8)
+            i = i + 1
+        var kind = "op${b0 & 15}"
+        let op = b0 & 15
+        if op == 1
+            kind = "text"
+        else if op == 2
+            kind = "bin"
+        else if op == 0
+            kind = "cont"
+        else if op == 8
+            kind = "close"
+        else if op == 9
+            kind = "ping"
+        else if op == 10
+            kind = "pong"
+        if (b0 & 0x80) == 0
+            kind = kind + "-"
+        if masked
+            kind = kind + "M"
+        if (b0 & 0x40) != 0
+            kind = kind + "R"
+        var shown = tohex(payload)
+        if op == 1
+            shown = text_of(payload)
+        if op == 8
+            shown = "none"
+            if n >= 2
+                shown = "${(payload[0] as Int << 8) | payload[1] as Int}"
+        if n > 40 and op != 8
+            shown = "#${n}"
+        list.push(out, kind + ":" + shown)
+        at = p + n
+    out
+
+fn event_text(ev: WsConnEvent) -> Str
+    match ev
+        WsMessageReceived(msg) =>
+            match msg
+                TextMessage(b)   =>
+                    if list.len(b) > 40
+                        "T#${list.len(b)}"
+                    else
+                        "T:" + text_of(b)
+                BinaryMessage(b) =>
+                    if list.len(b) > 40
+                        "B#${list.len(b)}"
+                    else
+                        "B:" + tohex(b)
+        WsFragmentReceived(f)  => "F${f.header.fin}:${tohex(f.payload)}"
+        WsPingAnswered(p)      => "ping:" + tohex(p)
+        WsPongReceived(ms)     => "pong@${ms}"
+        WsCloseReceived(k)     => "close:${wsclose.number_of(k.code)}"
+        WsCloseCompleted       => "done"
+
+fn fault_text(f: ?WsConnError) -> Str
+    match f
+        None    => "-"
+        Some(e) =>
+            match wsconnerr.close_code_for(e)
+                Some(code) => "err:${wsclose.number_of(code)}"
+                None       => "err:none"
+
+// Everything one run of the script taught.
+struct Run
+    events: Str
+    sent: Str
+    fault: Str
+    conn: WsConn
+
+// Pump once for each chunk and once more, stopping at the first fault.
+fn drive_at(conn: WsConn, chunks: [[u8]], eof: Bool, now: Int) -> Run [mutate]
+    load(chunks, eof)
+    var cur = conn
+    var events: [Str] = []
+    var fault: ?WsConnError = None
+    var turns = 0
+    while turns <= list.len(chunks) and fault == None
+        match wsconn.pump(cur, wire(), now)
+            Err(e)   =>
+                fault = Some(e)
+            Ok(turn) =>
+                cur = turn.conn
+                for ev in turn.events
+                    list.push(events, event_text(ev))
+        turns = turns + 1
+    Run { events: str.join(events, "|"), sent: str.join(frames_sent(g_out), "|"),
+          fault: fault_text(fault), conn: cur }
+
+fn drive(conn: WsConn, chunks: [[u8]]) -> Run [mutate]
+    drive_at(conn, chunks, false, 0)
+
+fn server() -> WsConn
+    wsconn.connection(ServerSide, wsconn.quiet_options(), WsDeflateOff, None)
+
+fn client() -> WsConn
+    wsconn.connection(ClientSide, wsconn.quiet_options(), WsDeflateOff, None)
+
+// What a script is expected to teach, in one assertion.
+fn expect(r: Run, events: Str, sent: Str, fault: Str)
+    test.assert_eq(r.events, events)
+    test.assert_eq(r.sent, sent)
+    test.assert_eq(r.fault, fault)
+
+// A transport that reports itself closed, and refuses every write.
+struct Shut
+    tag: Int
+
+impl WsTransport[] for Shut
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError>
+        Err(IoBrokenPipe)
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError>
+        Ok(bytes.zeros(0))
+
+    fn ws_close(self) -> ?IoError
+        None
+
+    fn ws_is_open(self) -> Bool
+        false
+
+// ── RFC 6455 section 5.7 ────────────────────────────────────────────
+
+@test
+fn test_the_rfc_examples_of_single_frame_messages() [mutate]
+    test.case("a single-frame unmasked text message, to a client")
+    expect(drive(client(), [hex("810548656c6c6f")]), "T:Hello", "", "-")
+
+    test.case("a single-frame masked text message, to a server")
+    expect(drive(server(), [hex("818537fa213d7f9f4d5158")]), "T:Hello", "", "-")
+
+    test.case("a fragmented unmasked text message")
+    expect(drive(client(), [hex("010348656c"), hex("80026c6f")]), "T:Hello", "", "-")
+
+    test.case("a ping, to a client, is answered with a masked pong")
+    expect(drive(client(), [hex("890548656c6c6f")]), "ping:48656c6c6f", "pongM:48656c6c6f", "-")
+
+    test.case("a masked pong nobody asked for is not an event")
+    expect(drive(server(), [hex("8a8537fa213d7f9f4d5158")]), "", "", "-")
+
+@test
+fn test_the_rfc_examples_of_long_binary_messages() [mutate]
+    test.case("256 bytes in the 16-bit length form")
+    expect(drive(client(), [joined([hex("827e0100"), repeated("01", 256)])]), "B#256", "", "-")
+
+    test.case("64 KiB in the 64-bit length form")
+    expect(drive(client(), [joined([hex("827f0000000000010000"), repeated("01", 65536)])]),
+        "B#65536",
+        "",
+        "-")
+
+// ── 1 Framing ───────────────────────────────────────────────────────
+
+@test
+fn test_1_1_text_messages_of_every_length_form() [mutate]
+    // 125 is the largest 7-bit length, 126 the smallest 16-bit one.
+    for n in [0, 1, 125, 126, 127, 128, 65535, 65536]
+        test.case("${n} bytes of text")
+        let r = drive(server(), [c(0x81, repeated("61", n))])
+        if n > 40
+            expect(r, "T#${n}", "", "-")
+        else
+            expect(r, "T:" + text_of(repeated("61", n)), "", "-")
+
+@test
+fn test_1_2_binary_messages_of_every_length_form() [mutate]
+    for n in [0, 125, 126, 127, 128, 65535, 65536]
+        test.case("${n} bytes of binary")
+        let r = drive(server(), [c(0x82, repeated("fe", n))])
+        if n > 40
+            expect(r, "B#${n}", "", "-")
+        else
+            expect(r, "B:" + tohex(repeated("fe", n)), "", "-")
+
+// ── 2 Pings and pongs ───────────────────────────────────────────────
+
+@test
+fn test_2_1_to_2_4_a_ping_is_answered_with_a_pong_of_the_same_payload() [mutate]
+    test.case("no payload")
+    expect(drive(server(), [c(0x89, [])]), "ping:", "pong:", "-")
+
+    test.case("a short text payload")
+    expect(drive(server(), [c(0x89, str_bytes("Hello, world!"))]), "ping:48656c6c6f2c20776f726c6421",
+           "pong:48656c6c6f2c20776f726c6421", "-")
+
+    test.case("125 bytes, the most a control frame holds")
+    let big = repeated("ab", 125)
+    expect(drive(server(), [c(0x89, big)]), "ping:" + tohex(big), "pong:#125", "-")
+
+@test
+fn test_2_5_a_ping_over_125_bytes_fails_the_connection() [mutate]
+    expect(drive(server(), [c(0x89, repeated("00", 126))]), "", "close:1002", "err:1002")
+
+@test
+fn test_2_6_a_ping_that_arrives_a_byte_at_a_time_is_answered_once() [mutate]
+    let whole = c(0x89, str_bytes("Hello, world!"))
+    var pieces: [[u8]] = []
+    for b in whole
+        list.push(pieces, [b])
+    expect(drive(server(), pieces),
+        "ping:48656c6c6f2c20776f726c6421",
+        "pong:48656c6c6f2c20776f726c6421",
+        "-")
+
+@test
+fn test_2_7_to_2_9_pongs_nobody_asked_for_are_ignored() [mutate]
+    test.case("an empty pong")
+    expect(drive(server(), [c(0x8a, [])]), "", "", "-")
+
+    test.case("a pong with a payload")
+    expect(drive(server(), [c(0x8a, str_bytes("Hello, world!"))]), "", "", "-")
+
+    test.case("a pong and then a ping, in one write")
+    expect(drive(server(), [joined([c(0x8a, str_bytes("ignored")), c(0x89, str_bytes("answered"))])]),
+           "ping:" + tohex(str_bytes("answered")), "pong:" + tohex(str_bytes("answered")), "-")
+
+@test
+fn test_2_10_and_2_11_ten_pings_get_ten_pongs_in_order() [mutate]
+    var pings: [[u8]] = []
+    var want: [Str] = []
+    var heard: [Str] = []
+    var i = 0
+    while i < 10
+        list.push(pings, c(0x89, str_bytes("ping${i}")))
+        list.push(want, "pong:" + tohex(str_bytes("ping${i}")))
+        list.push(heard, "ping:" + tohex(str_bytes("ping${i}")))
+        i = i + 1
+
+    test.case("in one write")
+    expect(drive(server(), [joined(pings)]), str.join(heard, "|"), str.join(want, "|"), "-")
+
+    test.case("in ten writes")
+    expect(drive(server(), pings), str.join(heard, "|"), str.join(want, "|"), "-")
+
+// ── 3 Reserved bits ─────────────────────────────────────────────────
+
+@test
+fn test_3_a_set_reserved_bit_fails_the_connection_with_1002() [mutate]
+    test.case("RSV1 on a text frame")
+    expect(drive(server(), [c(0xc1, str_bytes("small payload"))]), "", "close:1002", "err:1002")
+
+    test.case("RSV2 on a text frame")
+    expect(drive(server(), [c(0xa1, str_bytes("small payload"))]), "", "close:1002", "err:1002")
+
+    test.case("RSV3 on a text frame")
+    expect(drive(server(), [c(0x91, str_bytes("small payload"))]), "", "close:1002", "err:1002")
+
+    test.case("RSV1 and RSV3 on a binary frame")
+    expect(drive(server(), [c(0xd2, str_bytes("small payload"))]), "", "close:1002", "err:1002")
+
+    test.case("all three on a ping")
+    expect(drive(server(), [c(0xf9, [])]), "", "close:1002", "err:1002")
+
+    test.case("RSV1 on a close frame")
+    expect(drive(server(), [c(0xc8, close_body(1000, ""))]), "", "close:1002", "err:1002")
+
+    test.case("a frame before it that was fine is still delivered")
+    expect(drive(server(), [joined([c(0x81, str_bytes("fine")), c(0xc1, str_bytes("bad"))])]),
+           "T:fine", "close:1002", "err:1002")
+
+// ── 4 Opcodes ───────────────────────────────────────────────────────
+
+@test
+fn test_4_1_the_reserved_data_opcodes_fail_the_connection() [mutate]
+    for op in [3, 4, 5, 6, 7]
+        test.case("opcode ${op}")
+        expect(drive(server(), [c(0x80 + op, [])]), "", "close:1002", "err:1002")
+
+@test
+fn test_4_2_the_reserved_control_opcodes_fail_the_connection() [mutate]
+    for op in [11, 12, 13, 14, 15]
+        test.case("opcode ${op}")
+        expect(drive(server(), [c(0x80 + op, [])]), "", "close:1002", "err:1002")
+
+// ── 5 Fragmentation ─────────────────────────────────────────────────
+
+@test
+fn test_5_1_and_5_2_a_fragmented_control_frame_fails_the_connection() [mutate]
+    test.case("a ping with fin clear")
+    expect(drive(server(), [c(0x09, str_bytes("fragment1"))]), "", "close:1002", "err:1002")
+
+    test.case("a pong with fin clear")
+    expect(drive(server(), [c(0x0a, str_bytes("fragment1"))]), "", "close:1002", "err:1002")
+
+@test
+fn test_5_3_to_5_5_a_message_in_two_fragments_arrives_whole() [mutate]
+    let one = c(0x01, str_bytes("fragment1"))
+    let two = c(0x80, str_bytes("fragment2"))
+
+    test.case("in one write")
+    expect(drive(server(), [joined([one, two])]), "T:fragment1fragment2", "", "-")
+
+    test.case("in two writes")
+    expect(drive(server(), [one, two]), "T:fragment1fragment2", "", "-")
+
+    test.case("a byte at a time")
+    var pieces: [[u8]] = []
+    for b in joined([one, two])
+        list.push(pieces, [b])
+    expect(drive(server(), pieces), "T:fragment1fragment2", "", "-")
+
+@test
+fn test_5_6_to_5_8_a_ping_between_fragments_is_answered_at_once() [mutate]
+    let one = c(0x01, str_bytes("fragment1"))
+    let ping = c(0x89, str_bytes("pongme"))
+    let two = c(0x80, str_bytes("fragment2"))
+    let want_events = "ping:" + tohex(str_bytes("pongme")) + "|T:fragment1fragment2"
+    let want_sent = "pong:" + tohex(str_bytes("pongme"))
+
+    test.case("in one write")
+    expect(drive(server(), [joined([one, ping, two])]), want_events, want_sent, "-")
+
+    test.case("in three writes")
+    expect(drive(server(), [one, ping, two]), want_events, want_sent, "-")
+
+    test.case("the ping a byte at a time")
+    var pieces: [[u8]] = [one[:]]
+    for b in ping
+        list.push(pieces, [b])
+    list.push(pieces, two[:])
+    expect(drive(server(), pieces), want_events, want_sent, "-")
+
+@test
+fn test_5_9_to_5_12_a_continuation_with_nothing_to_continue_fails() [mutate]
+    test.case("fin set")
+    expect(drive(server(), [c(0x80, str_bytes("non-continuation payload"))]),
+        "",
+        "close:1002",
+        "err:1002")
+
+    test.case("fin clear")
+    expect(drive(server(), [c(0x00, str_bytes("non-continuation payload"))]),
+        "",
+        "close:1002",
+        "err:1002")
+
+    test.case("after a message that was whole")
+    expect(drive(server(), [joined([c(0x81, str_bytes("whole")), c(0x80, str_bytes("stray"))])]),
+           "T:whole", "close:1002", "err:1002")
+
+@test
+fn test_5_13_to_5_16_a_message_followed_by_a_stray_continuation() [mutate]
+    // 5.15: the first message is delivered, and the stray frame after it
+    // ends the connection.
+    expect(drive(server(), [joined([c(0x01, str_bytes("fragment1")), c(0x80, str_bytes("fragment2")),
+                                    c(0x80, str_bytes("fragment3"))])]),
+           "T:fragment1fragment2", "close:1002", "err:1002")
+
+    // 5.16 and 5.17: continuation frames with nothing to continue.
+    expect(drive(server(), [joined([c(0x00, str_bytes("fragment1")), c(0x00, str_bytes("fragment2"))])]),
+           "", "close:1002", "err:1002")
+
+@test
+fn test_5_18_a_new_data_frame_inside_a_fragmented_message_fails() [mutate]
+    expect(drive(server(), [joined([c(0x01, str_bytes("Hello, ")), c(0x81, str_bytes("world!"))])]),
+           "", "close:1002", "err:1002")
+
+@test
+fn test_5_19_and_5_20_pings_and_pongs_between_fragments_keep_their_order() [mutate]
+    let events = "ping:" + tohex(str_bytes("ping1")) + "|ping:" + tohex(str_bytes("ping2"))
+        + "|T#45"
+    let sent = "pong:" + tohex(str_bytes("ping1")) + "|pong:" + tohex(str_bytes("ping2"))
+    expect(drive(server(), [c(0x01, str_bytes("fragment1")), c(0x00, str_bytes("fragment2")),
+                            c(0x89, str_bytes("ping1")), c(0x8a, str_bytes("pong1")),
+                            c(0x00, str_bytes("fragment3")), c(0x89, str_bytes("ping2")),
+                            c(0x00, str_bytes("fragment4")), c(0x80, str_bytes("fragment5"))]),
+           events, sent, "-")
+
+// ── 6 UTF-8 ─────────────────────────────────────────────────────────
+
+fn invalid_text() -> [u8]
+    hex("cebae1bdb9cf83cebcceb5eda08065646974656400")
+
+@test
+fn test_6_1_empty_text_messages_in_one_or_more_frames() [mutate]
+    test.case("one empty frame")
+    expect(drive(server(), [c(0x81, [])]), "T:", "", "-")
+
+    test.case("three empty fragments")
+    expect(drive(server(), [joined([c(0x01, []), c(0x00, []), c(0x80, [])])]), "T:", "", "-")
+
+    test.case("empty, then bytes, then empty")
+    expect(drive(server(), [joined([c(0x01, []), c(0x00, str_bytes("A")), c(0x80, [])])]), "T:A", "", "-")
+
+@test
+fn test_6_2_valid_utf8_arrives_however_it_is_cut() [mutate]
+    let word = hex("cebae1bdb9cf83cebcceb5")
+    test.case("whole")
+    expect(drive(server(), [c(0x81, word)]), "T:" + text_of(word), "", "-")
+
+    test.case("in two fragments, cut inside the second character")
+    expect(drive(server(), [joined([c(0x01, word[0:3]), c(0x80, word[3:11])])]),
+        "T:" + text_of(word),
+        "",
+        "-")
+
+    test.case("a byte to a fragment")
+    var frames: [[u8]] = []
+    var i = 0
+    while i < list.len(word)
+        var b0 = 0x00
+        if i == 0
+            b0 = 0x01
+        if i == list.len(word) - 1
+            b0 = 0x80
+        list.push(frames, c(b0, [word[i]]))
+        i = i + 1
+    expect(drive(server(), [joined(frames)]), "T:" + text_of(word), "", "-")
+
+@test
+fn test_6_3_invalid_text_fails_the_connection_with_1007() [mutate]
+    test.case("a surrogate in the middle")
+    expect(drive(server(), [c(0x81, invalid_text())]), "", "close:1007", "err:1007")
+
+    test.case("the same bytes cut into two fragments")
+    expect(drive(server(), [joined([c(0x01, invalid_text()[0:12]), c(0x80, invalid_text()[12:21])])]),
+           "", "close:1007", "err:1007")
+
+    test.case("a valid first fragment does not make the whole valid")
+    expect(drive(server(), [joined([c(0x01, hex("cebae1bdb9")), c(0x00, hex("f4908080")), c(0x80, hex("65"))])]),
+           "", "close:1007", "err:1007")
+
+@test
+fn test_6_5_to_6_23_the_shapes_of_invalid_utf8() [mutate]
+    let bad = ["80", "bf", "c0af", "c1bf", "e080af", "e09fbf", "edbfbf", "eda080", "f08faf", "f4908080",
+               "f5808080", "fe", "ff", "e18080e1", "c2", "e1bd", "f0bdb9", "ceba20c2", "f8888080 80"]
+    for h in bad
+        test.case("bytes ${h}")
+        let body = hex(str.replace(h, " ", ""))
+        expect(drive(server(), [c(0x81, body)]), "", "close:1007", "err:1007")
+
+    // The largest valid values in each length are valid.
+    let good = ["7f", "c280", "dfbf", "e0a080", "ed9fbf", "ee8080", "efbfbf", "f0908080", "f48fbfbf"]
+    for h in good
+        test.case("bytes ${h}")
+        let body = hex(h)
+        expect(drive(server(), [c(0x81, body)]), "T:" + text_of(body), "", "-")
+
+    test.case("binary frames are not checked")
+    expect(drive(server(), [c(0x82, hex("fffe"))]), "B:fffe", "", "-")
+
+// ── 7 Closing ───────────────────────────────────────────────────────
+
+@test
+fn test_7_1_the_peer_closes_and_this_end_answers() [mutate]
+    test.case("a normal closure is echoed and the handshake is complete")
+    let r = drive(server(), [c(0x88, close_body(1000, ""))])
+    expect(r, "close:1000|done", "close:1000", "-")
+    test.assert(not wsconn.can_send(r.conn))
+    test.assert(not wsconn.can_receive(r.conn))
+    match wsconn.peer_close(r.conn)
+        Some(k) => test.assert_eq(wsclose.number_of(k.code), 1000)
+        None    => test.assert(false)
+
+    test.case("the reason is not echoed")
+    expect(drive(server(), [c(0x88, close_body(1001, "bye"))]), "close:1001|done", "close:1001", "-")
+
+    test.case("nothing after the close is read: a second close, a ping, a text")
+    expect(drive(server(), [joined([c(0x88, close_body(1000, "")), c(0x88, close_body(1000, ""))])]),
+           "close:1000|done", "close:1000", "-")
+    expect(drive(server(), [joined([c(0x88, close_body(1000, "")), c(0x89, [])])]),
+           "close:1000|done", "close:1000", "-")
+    expect(drive(server(), [joined([c(0x88, close_body(1000, "")), c(0x81, str_bytes("late"))])]),
+           "close:1000|done", "close:1000", "-")
+
+    test.case("a close in the middle of a fragmented message drops the message")
+    expect(drive(server(),
+        [joined([c(0x01, str_bytes("part")), c(0x88, close_body(1000, "")), c(0x80, str_bytes("rest"))])]),
+           "close:1000|done", "close:1000", "-")
+
+@test
+fn test_7_3_close_bodies() [mutate]
+    test.case("an empty body is a close with no status, answered with 1000")
+    expect(drive(server(), [c(0x88, [])]), "close:1005|done", "close:1000", "-")
+
+    test.case("one byte cannot be a status")
+    expect(drive(server(), [c(0x88, [0x03])]), "", "close:1002", "err:1002")
+
+    test.case("a reason of 123 bytes is the most that fits")
+    expect(drive(server(), [c(0x88, close_body(1000, text_of(repeated("61", 123))))]),
+        "close:1000|done",
+        "close:1000",
+        "-")
+
+    test.case("a reason of 124 bytes makes the frame too long")
+    expect(drive(server(), [c(0x88, close_body(1000, text_of(repeated("61", 124))))]),
+        "",
+        "close:1002",
+        "err:1002")
+
+    test.case("a reason that is not UTF-8")
+    expect(drive(server(), [c(0x88, joined([close_body(1000, ""), hex("fffe")]))]),
+        "",
+        "close:1007",
+        "err:1007")
+
+@test
+fn test_7_7_the_status_codes_a_peer_may_send_are_echoed() [mutate]
+    for code in [1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 3000, 3999, 4000, 4999]
+        test.case("${code}")
+        expect(drive(server(), [c(0x88, close_body(code, ""))]),
+            "close:${code}|done",
+            "close:${code}",
+            "-")
+
+@test
+fn test_7_9_the_status_codes_nobody_may_send_fail_the_connection() [mutate]
+    for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 1100, 2000, 2999]
+        test.case("${code}")
+        expect(drive(server(), [c(0x88, close_body(code, ""))]), "", "close:1002", "err:1002")
+
+// ── 9 Limits ────────────────────────────────────────────────────────
+
+@test
+fn test_9_large_messages_in_one_frame_and_in_many() [mutate]
+    let mib = repeated("5a", 1048576)
+
+    test.case("a 1 MiB text message in one frame")
+    expect(drive(server(), [c(0x81, mib)]), "T#1048576", "", "-")
+
+    test.case("a 1 MiB binary message in 1 KiB fragments")
+    var frames: [[u8]] = []
+    var at = 0
+    while at < 1048576
+        var b0 = 0x00
+        if at == 0
+            b0 = 0x02
+        if at + 1024 == 1048576
+            b0 = 0x80
+        list.push(frames, c(b0, mib[at:at + 1024]))
+        at = at + 1024
+    expect(drive(server(), [joined(frames)]), "B#1048576", "", "-")
+
+@test
+fn test_9_a_frame_or_message_over_the_limit_is_refused_with_1009() [mutate]
+    var small = wsconn.quiet_options()
+    small = WsConnOptions {
+        limits: WsLimits { max_frame: 1000, max_message: 3000 }, close_timeout_ms: 5000,
+        pong_timeout_ms: 0, ping_interval_ms: 0, max_send_frame: 65536, compress_outgoing: true }
+    let tight = wsconn.connection(ServerSide, small, WsDeflateOff, None)
+
+    test.case("a frame that declares more than the limit is refused before it arrives")
+    expect(drive(tight, [hex("82ff000000003b9aca00"), hex("00000000")]), "", "close:1009", "err:1009")
+
+    test.case("a message that grows past the limit in fragments")
+    expect(drive(tight, [joined([c(0x02, repeated("01", 900)), c(0x00, repeated("01", 900)),
+                                 c(0x00, repeated("01", 900)), c(0x00, repeated("01", 900))])]),
+           "", "close:1009", "err:1009")
+
+    test.case("a message that fits in the same fragments")
+    expect(drive(tight, [joined([c(0x02, repeated("01", 900)), c(0x00, repeated("01", 900)),
+                                 c(0x80, repeated("01", 900))])]),
+           "B#2700", "", "-")
+
+@test
+fn test_9_with_reassembly_off_each_fragment_is_an_event() [mutate]
+    let stream = WsConnOptions {
+        limits: WsLimits { max_frame: 65536, max_message: 0 }, close_timeout_ms: 5000,
+        pong_timeout_ms: 0, ping_interval_ms: 0, max_send_frame: 65536, compress_outgoing: true }
+    let streaming = wsconn.connection(ServerSide, stream, WsDeflateOff, None)
+    expect(drive(streaming,
+        [joined([c(0x01, str_bytes("ab")), c(0x00, str_bytes("cd")), c(0x80, str_bytes("ef"))])]),
+           "F" + "false:6162|Ffalse:6364|Ftrue:6566", "", "-")
+
+// ── 10 Misc ─────────────────────────────────────────────────────────
+
+@test
+fn test_10_1_a_message_in_a_thousand_one_byte_fragments() [mutate]
+    var frames: [[u8]] = []
+    var i = 0
+    while i < 1000
+        var b0 = 0x00
+        if i == 0
+            b0 = 0x02
+        if i == 999
+            b0 = 0x80
+        list.push(frames, c(b0, [0x41]))
+        i = i + 1
+    expect(drive(server(), [joined(frames)]), "B#1000", "", "-")
+
+// ── Who may mask ────────────────────────────────────────────────────
+
+@test
+fn test_a_server_refuses_an_unmasked_frame_and_a_client_a_masked_one() [mutate]
+    test.case("an unmasked frame from a client")
+    expect(drive(server(), [s(0x81, str_bytes("plain"))]), "", "close:1002", "err:1002")
+
+    test.case("a masked frame from a server")
+    expect(drive(client(), [c(0x81, str_bytes("masked"))]), "", "closeM:1002", "err:1002")
+
+// ── The socket goes ─────────────────────────────────────────────────
+
+@test
+fn test_a_socket_that_closes_without_a_close_frame_is_reported_and_not_answered() [mutate]
+    test.case("the transport reports the close")
+    expect(drive_at(server(), [], true, 0), "", "", "err:none")
+
+    test.case("a half-received frame does not make it a message")
+    let r = drive_at(server(), [hex("8185")], true, 0)
+    expect(r, "", "", "err:none")
+
+@test
+fn test_a_transport_that_reports_itself_closed_with_an_empty_read_is_a_closed_socket() [mutate]
+    load([], false)
+    match wsconn.pump(server(), Shut { tag: 0 }, 0)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert_eq(fault_text(Some(e)), "err:none")

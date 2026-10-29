@@ -1,0 +1,42 @@
+// tls_probe.nv — the TLS transport against a TLS peer, run by
+// tests/tls_loopback.sh with the port and the certificate it made.
+
+use std.bytes
+use std.tls
+use std.env
+use wstrans
+
+fn show(label: Str, r: Result<Bytes, IoError>) [io]
+    match r
+        Ok(b)  => println("${label} ok ${bytes.len(b)}")
+        Err(e) => println("${label} err ${e.message()}")
+
+// The read after the peer's half second of quiet, which has to wait for it.
+fn eventually(t: WsTls, tries: Int) -> Result<Bytes, IoError> [net]
+    match t.ws_recv(100)
+        Err(IoTimedOut) =>
+            if tries > 0
+                eventually(t, tries - 1)
+            else
+                Err(IoTimedOut)
+        other           => other
+
+fn main() [io, net]
+    let port = str.to_int(env.get("TLS_PORT") ?? "0") ?? 0
+    let cfg = TlsConfig {
+        hostname: "localhost", verify_peer: true, ca_bundle_path: env.get("TLS_CA") ?? "",
+        cert_path: "", key_path: "" }
+    match wstrans.dial_tls("127.0.0.1", port, cfg)
+        Err(e) => println("dial err ${e.message()}")
+        Ok(t)  =>
+            println("open ${t.ws_is_open()}")
+            match t.ws_send(bytes.from_str("hello"))
+                Ok(n)  => println("sent ${n}")
+                Err(_) => println("send err")
+            show("echo", t.ws_recv(100))
+            let _ = tls.set_recv_timeout(t.conn, 100)
+            show("quiet", t.ws_recv(100))
+            show("closed", eventually(t, 20))
+            match t.ws_close()
+                None    => println("closed ok")
+                Some(_) => println("close err")

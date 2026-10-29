@@ -1,10 +1,6 @@
 // wsconn_tests.nv — the close handshake, and the four Autobahn cases a
 // one-boolean connection cannot pass.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: websocket-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
 // `WsScript` below implements `WsTransport[]` — a transport over bytes
 // already in memory — and the functions that drive a connection over

@@ -1,0 +1,472 @@
+// wsdeflate_tests.nv — permessage-deflate: the negotiation table and the
+// compressed payloads.
+//
+// The streams in the vectors section are written by CPython's zlib, which
+// is the independent encoder the decoder is checked against. The
+// compressed output of this package is checked the other way: the bytes
+// asserted for "Hello" and for the empty message are the ones RFC 7692
+// section 7.2.3 prints, and every other compressed payload is inflated
+// by this package's decoder and by zlib's. `tests/vectors.py` regenerates
+// the vectors.
+
+use std.test
+use std.bytes
+use wsdeflate
+
+fn unhex(h: Str) -> Bytes
+    bytes.from_hex(h) ?? bytes.zeros(0)
+
+fn both_reset() -> WsDeflateParams
+    wsdeflate.default_params()
+
+fn params(snct: Bool, cnct: Bool, sbits: Int, cbits: Int) -> WsDeflateParams
+    WsDeflateParams { server_no_context_takeover: snct, client_no_context_takeover: cnct,
+                      server_max_window_bits: sbits, client_max_window_bits: cbits }
+
+// The parameters a decision settled on, as one line, or "off".
+fn shown(s: WsDeflateState) -> Str
+    match s
+        WsDeflateOff   => "off"
+        WsDeflateOn(p) =>
+            "on snct=${p.server_no_context_takeover} cnct=${p.client_no_context_takeover} sbits=${p.server_max_window_bits} cbits=${p.client_max_window_bits}"
+
+fn accepted(offer: Str, limits: WsDeflateParams) -> Str
+    shown(wsdeflate.accept_offer(offer, limits))
+
+// What a client made of an answer, as one line, or the refusal.
+fn answered(answer: Str, offered: WsDeflateParams) -> Str
+    match wsdeflate.check_answer(answer, offered)
+        Ok(s)  => shown(s)
+        Err(_) => "refused"
+
+fn relaxed() -> WsDeflateParams
+    params(false, false, 15, 15)
+
+// ── Rendering ───────────────────────────────────────────────────────
+
+@test
+fn test_the_default_offer_and_answer_are_spelled_as_the_rfc_spells_them() [io]
+    test.case("the default offer asks both sides to drop context and offers a client window")
+    test.assert_eq(wsdeflate.offer_header(both_reset()),
+                   "permessage-deflate; server_no_context_takeover; client_no_context_takeover; client_max_window_bits")
+
+    test.case("a narrower window is written with its value")
+    test.assert_eq(wsdeflate.offer_header(params(false, false, 10, 9)),
+                   "permessage-deflate; server_max_window_bits=10; client_max_window_bits=9")
+
+    test.case("an answer names only what is not the default")
+    test.assert_eq(wsdeflate.answer_header(both_reset()),
+                   "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
+    test.assert_eq(wsdeflate.answer_header(params(false, false, 12, 11)),
+                   "permessage-deflate; server_max_window_bits=12; client_max_window_bits=11")
+    test.assert_eq(wsdeflate.answer_header(relaxed()), "permessage-deflate")
+
+    test.case("the field is named as the registry spells it")
+    test.assert_eq(wsdeflate.extensions_header(), "Sec-WebSocket-Extensions")
+
+// ── A server reading an offer ───────────────────────────────────────
+
+@test
+fn test_a_server_accepts_a_plain_offer_with_its_own_limits() [io]
+    test.case("a bare offer takes the server's no_context_takeover choices")
+    test.assert_eq(accepted("permessage-deflate", both_reset()),
+                   "on snct=true cnct=true sbits=15 cbits=15")
+
+    test.case("a server with no such choice answers without them")
+    test.assert_eq(accepted("permessage-deflate", relaxed()),
+                   "on snct=false cnct=false sbits=15 cbits=15")
+
+    test.case("an offered flag is kept whatever the server would choose")
+    test.assert_eq(accepted("permessage-deflate; server_no_context_takeover; client_no_context_takeover", relaxed()),
+                   "on snct=true cnct=true sbits=15 cbits=15")
+
+    test.case("the empty offer names nothing")
+    test.assert_eq(accepted("", both_reset()), "off")
+
+@test
+fn test_a_server_narrows_a_window_and_never_widens_one() [io]
+    test.case("a window the client offered is kept")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=9", relaxed()),
+                   "on snct=false cnct=false sbits=9 cbits=15")
+
+    test.case("a server whose limit is narrower narrows it further")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=14", params(false, false, 12, 15)),
+                   "on snct=false cnct=false sbits=12 cbits=15")
+
+    test.case("a limit wider than the offer does not widen it")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=9", params(false, false, 15, 15)),
+                   "on snct=false cnct=false sbits=9 cbits=15")
+
+    test.case("a window the client did not name stays at 15 whatever the limit says")
+    test.assert_eq(accepted("permessage-deflate", params(false, false, 10, 10)),
+                   "on snct=false cnct=false sbits=15 cbits=15")
+
+    test.case("a client window offered without a value takes the server's limit")
+    test.assert_eq(accepted("permessage-deflate; client_max_window_bits", params(false, false, 15, 11)),
+                   "on snct=false cnct=false sbits=15 cbits=11")
+
+    test.case("a client window offered with a value is kept")
+    test.assert_eq(accepted("permessage-deflate; client_max_window_bits=10", relaxed()),
+                   "on snct=false cnct=false sbits=15 cbits=10")
+
+    test.case("a quoted value is a value")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=\"10\"", relaxed()),
+                   "on snct=false cnct=false sbits=10 cbits=15")
+
+@test
+fn test_a_server_declines_an_offer_it_may_not_accept() [io]
+    test.case("a parameter RFC 7692 does not define")
+    test.assert_eq(accepted("permessage-deflate; x-webkit-deflate-frame", relaxed()), "off")
+
+    test.case("a window outside 8 to 15")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=7", relaxed()), "off")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=16", relaxed()), "off")
+    test.assert_eq(accepted("permessage-deflate; client_max_window_bits=x", relaxed()), "off")
+
+    test.case("a window parameter with no value on the server side")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits", relaxed()), "off")
+
+    test.case("a parameter given twice")
+    test.assert_eq(accepted("permessage-deflate; server_no_context_takeover; server_no_context_takeover", relaxed()),
+        "off")
+    test.assert_eq(accepted("permessage-deflate; client_no_context_takeover; client_no_context_takeover", relaxed()),
+        "off")
+    test.assert_eq(accepted("permessage-deflate; server_max_window_bits=9; server_max_window_bits=9", relaxed()),
+        "off")
+    test.assert_eq(accepted("permessage-deflate; client_max_window_bits; client_max_window_bits", relaxed()),
+        "off")
+
+    test.case("a flag that carries a value")
+    test.assert_eq(accepted("permessage-deflate; server_no_context_takeover=1", relaxed()), "off")
+    test.assert_eq(accepted("permessage-deflate; client_no_context_takeover=1", relaxed()), "off")
+
+    test.case("an extension that is not this one")
+    test.assert_eq(accepted("x-webkit-deflate-frame", relaxed()), "off")
+
+@test
+fn test_a_server_takes_the_first_offer_it_can_accept() [io]
+    test.case("an unknown extension before ours is passed over")
+    test.assert_eq(accepted("x-other, permessage-deflate; server_max_window_bits=10", relaxed()),
+                   "on snct=false cnct=false sbits=10 cbits=15")
+
+    test.case("an offer that must be declined is passed over for the next")
+    test.assert_eq(accepted("permessage-deflate; bogus, permessage-deflate; server_max_window_bits=11", relaxed()),
+                   "on snct=false cnct=false sbits=11 cbits=15")
+
+    test.case("when none can be accepted the answer is off")
+    test.assert_eq(accepted("permessage-deflate; bogus, permessage-deflate; server_max_window_bits=3", relaxed()),
+        "off")
+
+// ── A client reading the answer ─────────────────────────────────────
+
+@test
+fn test_a_client_reads_the_servers_answer_against_its_offer() [io]
+    test.case("no extension in the answer is a server that declined")
+    test.assert_eq(answered("", both_reset()), "off")
+    test.assert_eq(answered("   ", both_reset()), "off")
+
+    test.case("a bare answer keeps the client's own no_context_takeover and records the server's silence")
+    test.assert_eq(answered("permessage-deflate", both_reset()),
+                   "on snct=false cnct=true sbits=15 cbits=15")
+
+    test.case("the server's flags are recorded")
+    test.assert_eq(answered("permessage-deflate; server_no_context_takeover; client_no_context_takeover", relaxed()),
+                   "on snct=true cnct=true sbits=15 cbits=15")
+
+    test.case("a window narrower than the offer is accepted")
+    test.assert_eq(answered("permessage-deflate; server_max_window_bits=9", params(false, false, 12, 15)),
+                   "on snct=false cnct=false sbits=9 cbits=15")
+    test.assert_eq(answered("permessage-deflate; client_max_window_bits=9", relaxed()),
+                   "on snct=false cnct=false sbits=15 cbits=9")
+
+    test.case("a window the server left out stays what the client offered")
+    test.assert_eq(answered("permessage-deflate", params(false, false, 10, 11)),
+                   "on snct=false cnct=false sbits=10 cbits=11")
+
+@test
+fn test_a_client_refuses_an_answer_that_widens_or_invents() [io]
+    test.case("a window wider than the offer")
+    test.assert_eq(answered("permessage-deflate; server_max_window_bits=12", params(false, false, 10, 15)),
+        "refused")
+    test.assert_eq(answered("permessage-deflate; client_max_window_bits=14", params(false, false, 15, 12)),
+        "refused")
+
+    test.case("a server window the client never offered")
+    test.assert_eq(answered("permessage-deflate; server_max_window_bits=12", relaxed()), "refused")
+
+    test.case("a parameter nobody defined")
+    test.assert_eq(answered("permessage-deflate; x-webkit-deflate-frame", relaxed()), "refused")
+
+    test.case("another extension, or two elements")
+    test.assert_eq(answered("x-webkit-deflate-frame", relaxed()), "refused")
+    test.assert_eq(answered("permessage-deflate, permessage-deflate", relaxed()), "refused")
+
+    test.case("an invalid value")
+    test.assert_eq(answered("permessage-deflate; client_max_window_bits=99", relaxed()), "refused")
+
+// ── The numbers a connection asks for ───────────────────────────────
+
+@test
+fn test_each_side_asks_for_its_own_window_and_context() [io]
+    let p = params(true, false, 12, 15)
+
+    test.case("the window a side sends with")
+    test.assert_eq(wsdeflate.send_window_bits(p, true), 15)
+    test.assert_eq(wsdeflate.send_window_bits(p, false), 12)
+
+    test.case("whether a side drops its context")
+    test.assert(not wsdeflate.resets_context(p, true))
+    test.assert(wsdeflate.resets_context(p, false))
+
+    test.case("the size below which a message is sent as it is")
+    test.assert(not wsdeflate.worth_compressing(127))
+    test.assert(wsdeflate.worth_compressing(128))
+
+// ── The payload ─────────────────────────────────────────────────────
+
+@test
+fn test_the_rfc_examples_compress_to_the_rfc_bytes() [io]
+    let p = both_reset()
+
+    test.case("Hello is the seven bytes RFC 7692 section 7.2.3.1 prints")
+    match wsdeflate.compress(bytes.from_str("Hello"), p, true)
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "f248cdc9c90700")
+        Err(_) => test.assert(false)
+
+    test.case("the empty message is the single byte 00")
+    match wsdeflate.compress(bytes.zeros(0), p, true)
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "00")
+        Err(_) => test.assert(false)
+
+    test.case("a repetitive payload compresses to bytes zlib inflates to it")
+    // These bytes were inflated with zlib's raw decoder and gave the 63
+    // characters back.
+    match wsdeflate.compress(bytes.from_str("abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc"), p, true)
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "4a4c4aa6040100")
+        Err(_) => test.assert(false)
+
+@test
+fn test_what_this_package_compresses_it_inflates() [io]
+    let p = both_reset()
+    let plains = [vec_hello_plain(), vec_empty_plain(), vec_text300_plain(),
+                  vec_text5000_plain(), vec_noise1000_plain()]
+    for h in plains
+        let plain = unhex(h)
+        test.case("${bytes.len(plain)} bytes")
+        match wsdeflate.compress(plain, p, false)
+            Err(_)     => test.assert(false)
+            Ok(packed) =>
+                match wsdeflate.decompress(packed, p, false, 0)
+                    Err(_)  => test.assert(false)
+                    Ok(out) => test.assert(out == plain)
+
+@test
+fn test_a_window_shorter_than_deflates_cuts_the_message_into_pieces() [io]
+    // A window of 2^8 bytes cannot be reached back past, so the message
+    // is compressed in pieces of that size. The round trip proves the
+    // pieces join into one stream.
+    let plain = unhex(vec_text5000_plain())
+    let narrow = params(true, true, 8, 8)
+
+    test.case("a client with an 8-bit window")
+    match wsdeflate.compress(plain, narrow, true)
+        Err(_)     => test.assert(false)
+        Ok(packed) =>
+            match wsdeflate.decompress(packed, narrow, false, 0)
+                Err(_)  => test.assert(false)
+                Ok(out) => test.assert(out == plain)
+
+    test.case("a server with a 9-bit window, on a payload that is a whole number of pieces")
+    let exact = bytes.slice(plain, 0, 1024)
+    match wsdeflate.compress(exact, params(true, true, 9, 9), false)
+        Err(_)     => test.assert(false)
+        Ok(packed) =>
+            match wsdeflate.decompress(packed, narrow, true, 0)
+                Err(_)  => test.assert(false)
+                Ok(out) => test.assert(out == exact)
+
+@test
+fn test_streams_written_by_zlib_inflate_to_their_messages() [io]
+    let p = both_reset()
+    test.case("Hello")
+    expect_plain(vec_hello_packed(), vec_hello_plain(), p)
+    test.case("an empty message")
+    expect_plain(vec_empty_packed(), vec_empty_plain(), p)
+    test.case("300 bytes of text")
+    expect_plain(vec_text300_packed(), vec_text300_plain(), p)
+    test.case("5000 bytes of text")
+    expect_plain(vec_text5000_packed(), vec_text5000_plain(), p)
+    test.case("1000 bytes zlib could not shrink, so it stored them")
+    expect_plain(vec_noise1000_packed(), vec_noise1000_plain(), p)
+    test.case("a stream that ends its own block with BFINAL set")
+    expect_plain(vec_final_packed(), vec_final_plain(), p)
+
+fn expect_plain(packed_hex: Str, plain_hex: Str, p: WsDeflateParams)
+    match wsdeflate.decompress(unhex(packed_hex), p, true, 0)
+        Err(_)  => test.assert(false)
+        Ok(out) => test.assert(out == unhex(plain_hex))
+
+@test
+fn test_a_message_that_is_not_a_whole_stream_is_refused() [io]
+    let p = both_reset()
+
+    test.case("bytes that are not DEFLATE")
+    match wsdeflate.decompress(bytes.from_str("not deflate"), p, true, 65536)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a real stream cut inside a block")
+    match wsdeflate.decompress(unhex(vec_cut_packed()), p, true, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a stream that inflates past the limit")
+    match wsdeflate.decompress(unhex(vec_text5000_packed()), p, true, 1000)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("the same stream inside a limit that fits")
+    match wsdeflate.decompress(unhex(vec_text5000_packed()), p, true, 5000)
+        Ok(out) => test.assert_eq(bytes.len(out), 5000)
+        Err(_)  => test.assert(false)
+
+// ── A decoder that keeps the peer's window ──────────────────────────
+
+fn step_text(d: Inflater, packed_hex: Str, last: Bool, budget: Int) -> Str
+    match wsdeflate.inflate_step(d, unhex(packed_hex), last, budget)
+        Err(_)   => "refused"
+        Ok(pair) => bytes.to_hex(pair.1)
+
+@test
+fn test_messages_on_one_window_inflate_in_turn() [io]
+    // zlib wrote the three messages on one window, so the second and the
+    // third refer to bytes of the first. Inflating each on a fresh window
+    // fails; inflating them through one decoder gives them back.
+    let p = both_reset()
+
+    test.case("on a fresh window the second message is refused or wrong")
+    match wsdeflate.decompress(unhex(vec_seq1_packed()), p, true, 0)
+        Err(_)  => test.assert(true)
+        Ok(out) => test.assert(out != unhex(vec_seq1_plain()))
+
+    test.case("through one decoder, in order")
+    let d0 = wsdeflate.new_inflater()
+    match wsdeflate.inflate_step(d0, unhex(vec_seq0_packed()), true, 0)
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            test.assert_eq(bytes.to_hex(one.1), vec_seq0_plain())
+            match wsdeflate.inflate_step(one.0, unhex(vec_seq1_packed()), true, 0)
+                Err(_)  => test.assert(false)
+                Ok(two) =>
+                    test.assert_eq(bytes.to_hex(two.1), vec_seq1_plain())
+                    test.assert_eq(step_text(two.0, vec_seq2_packed(), true, 0), vec_seq2_plain())
+
+@test
+fn test_a_message_may_arrive_in_pieces() [io]
+    // Only the piece that ends the message gets the four bytes.
+    let whole = unhex(vec_text300_packed())
+    let cut = bytes.len(whole) / 2
+    let first = bytes.slice(whole, 0, cut)
+    let rest = bytes.slice(whole, cut, bytes.len(whole))
+
+    test.case("the first piece alone yields what it can")
+    match wsdeflate.inflate_step(wsdeflate.new_inflater(), first, false, 0)
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            test.case("and the last piece completes the message")
+            match wsdeflate.inflate_step(one.0, rest, true, 0)
+                Err(_)  => test.assert(false)
+                Ok(two) =>
+                    test.assert_eq(bytes.to_hex(bytes.concat([one.1, two.1])), vec_text300_plain())
+
+@test
+fn test_a_budget_bounds_what_one_message_may_inflate_to() [io]
+    test.case("a message past its budget is refused")
+    test.assert_eq(step_text(wsdeflate.new_inflater(), vec_text5000_packed(), true, 100), "refused")
+
+    test.case("the budget counts this message and not the ones before it")
+    let d0 = wsdeflate.new_inflater()
+    match wsdeflate.inflate_step(d0, unhex(vec_seq0_packed()), true, 30)
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            match wsdeflate.inflate_step(one.0, unhex(vec_seq1_packed()), true, 30)
+                Err(_)  => test.assert(false)
+                Ok(two) => test.assert_eq(bytes.to_hex(two.1), vec_seq1_plain())
+
+@test
+fn test_a_stream_the_peer_ended_starts_over_with_the_next_message() [io]
+    // A peer that wrote BFINAL ended its DEFLATE stream; its next message
+    // cannot refer to the one before.
+    let d0 = wsdeflate.new_inflater()
+    match wsdeflate.inflate_step(d0, unhex(vec_final_packed()), true, 0)
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            test.assert_eq(bytes.to_hex(one.1), vec_final_plain())
+            test.assert_eq(step_text(one.0, vec_hello_packed(), true, 0), vec_hello_plain())
+
+@test
+fn test_a_corrupt_stream_is_reported_by_the_step() [io]
+    test.assert_eq(step_text(wsdeflate.new_inflater(), "07", true, 0), "refused")
+
+// ── Vectors: written by zlib, see tests/vectors.py ──────────────────
+
+// BEGIN VECTORS
+
+fn vec_hello_packed() -> Str
+    "f248cdc9c90700"
+
+fn vec_hello_plain() -> Str
+    "48656c6c6f"
+
+fn vec_empty_packed() -> Str
+    "00"
+
+fn vec_empty_plain() -> Str
+    ""
+
+fn vec_text300_packed() -> Str
+    "4a4fcccd4d54484a2d4954482d28ceccc9cf83704a32d049104e49cd2949445690985390019142f0a0caa1a62169a942a8c12411c6235441f8c88e8088542198c84a6056220c045b9b0ef6228aefaa503d049383d1080f23fb280500"
+
+fn vec_text300_plain() -> Str
+    "67616d6d61206265746120657073696c6f6e2062657461207468657461207468657461207468657461206574612064656c7461206265746120746865746120616c706861206574612065746120616c70686120746865746120657073696c6f6e2064656c74612062657461207a65746120616c70686120616c70686120616c70686120616c706861206574612064656c74612065746120616c7068612064656c74612074686574612074686574612064656c7461207a6574612064656c74612064656c746120746865746120657073696c6f6e20616c7068612065746120626574612067616d6d6120657073696c6f6e2062657461207a657461206574612064656c746120657073696c6f6e20657073696c6f6e2074686574612065746120616c7068612074686574612064"
+
+fn vec_text5000_packed() -> Str
+    "7c585b72c2300cbc0a578ba74ce90cb4cc345f3e7d294ea27d391f0de0d896b45aade52ef7e76db9b4ebba3dfaffe373793c96cbf5f9fb75fff93e3e3faef7d7bbe5bd609bb18ebff7a2f5f6feb94d1ed3c6135ef77d499919cfb1b99be83a1106368bfbb65d5c291fc7efb139bb095e8daf9381b13680c3db1d9f3086663be33c021d135a0d8c27af6f6eda21d32d0a11047991949b6558bcdbc20c8ca75a1c7be33bd8a6e15e002e479ac634db804617e773d621fc3e4b15128ecde31b7c36a506828019a7c89b5029d125f842e5522903289a4601efd03fa4341a47bf7773c4c535040e14ae7c50923926265c52152240ac40089437ef139c336b54248e414f9748637405fd66704d8ec84f4ac7496248eee06d7210599a4a5cb49d0949258428c87ebdd6258540d0c5310c59b9350351bf03fd4a03e61436310726970bb512d2eb6122abb448d9eb33d5c228b5a2d201a55506c72f59c314cf6895640ead74c6857249d3132b5de8e30fc99a24852bdbeb98df83a430338520da85381fe7e1b1dd2efeba877ae878a743dc5ea3782aac8660aa56237b135794b84a2a38af9912505a01a702db4e3f0c3b3415169a2a8cf73965cccfe7c3f5c47a61c355f655ec6aba1613f7bf56a4a633e2db59c7a3e17b65274aa3a280dab850798766c8a25d3361bc3f6d85086ac3030d4dca8cc13e630ce6497a3c1e8d9ae3fd5b4d9bb787088ca166ddfda48164bf429b50b459f3013955cd281b1abf0ba1f448e9ecf32b95bb6c0ca27c7336709d9313f074a1c4465bc8cad58fe6a592029e1ee7fcfa45d7da702f0b19de678bbcc8af60cb2e71daa8b31f2e2b0adafc68f5eed60f32508cd46056696a15cb3d6fd68988644b18b9c227b750d9192074d8fcaa0b2b3944a76b5598386e9daadf6a0e2a87fb110ba2026ab7b2dc07e2a8b528a96cbcd9c4d2d05edf7d978612422100b374bbe64cf424dcbb04f1a012513af4bf26f9acf20b45b4aff144305e7bff01"
+
+fn vec_text5000_plain() -> Str
+    "616c70686120626574612062657461207a6574612067616d6d6120657073696c6f6e20657073696c6f6e2064656c746120616c7068612067616d6d612065746120657461207a65746120746865746120657073696c6f6e20616c70686120616c706861207a657461207468657461207a65746120657461206574612067616d6d612067616d6d612064656c74612064656c746120616c7068612067616d6d61207a6574612067616d6d612067616d6d61207a6574612067616d6d6120746865746120657461207a657461207a657461207a6574612074686574612067616d6d61206574612074686574612064656c746120746865746120657073696c6f6e207468657461207a657461207468657461207468657461207a6574612074686574612074686574612064656c7461207a6574612067616d6d6120657073696c6f6e20746865746120657073696c6f6e20657073696c6f6e2065746120657073696c6f6e2064656c7461207468657461207a6574612062657461207a65746120616c7068612064656c7461206265746120616c70686120616c70686120657073696c6f6e2064656c746120626574612067616d6d6120657073696c6f6e2064656c74612064656c746120616c7068612065746120616c70686120616c706861207a657461207a6574612067616d6d612064656c746120616c70686120626574612062657461206265746120616c70686120616c70686120616c706861207a65746120657073696c6f6e2067616d6d612067616d6d612067616d6d6120616c7068612065746120616c7068612064656c74612067616d6d6120616c70686120616c706861207a657461206265746120657073696c6f6e207a65746120746865746120616c70686120657073696c6f6e20746865746120616c70686120657073696c6f6e206574612067616d6d612074686574612064656c74612062657461207a657461206265746120616c7068612074686574612067616d6d6120657461207468657461207a6574612067616d6d61207a65746120657073696c6f6e20657073696c6f6e2065746120616c7068612067616d6d6120616c70686120657073696c6f6e20616c7068612067616d6d612067616d6d612067616d6d6120626574612074686574612064656c746120616c7068612064656c74612064656c7461207468657461206265746120657073696c6f6e20626574612064656c7461207a65746120657073696c6f6e2065746120657073696c6f6e20616c7068612067616d6d6120616c70686120657461206574612067616d6d61206265746120626574612064656c74612062657461206265746120616c7068612067616d6d612064656c746120626574612064656c746120616c70686120746865746120746865746120657073696c6f6e206574612064656c74612064656c7461206574612065746120616c70686120616c706861206574612067616d6d612062657461207468657461207a65746120616c7068612062657461207a65746120657073696c6f6e207a65746120657073696c6f6e20616c706861206574612062657461206265746120657073696c6f6e2064656c746120616c70686120746865746120616c706861206574612074686574612074686574612064656c7461206265746120616c70686120657073696c6f6e20616c706861207a65746120657073696c6f6e20626574612064656c74612074686574612064656c74612062657461207a657461206574612074686574612067616d6d61207a65746120657461206265746120657073696c6f6e206265746120626574612062657461207a657461206574612064656c7461206265746120616c70686120746865746120616c70686120746865746120657073696c6f6e207a6574612074686574612067616d6d61207a65746120657073696c6f6e2074686574612074686574612065746120746865746120657073696c6f6e206574612064656c74612067616d6d6120746865746120657073696c6f6e20657461206265746120626574612062657461207a6574612067616d6d612067616d6d61206574612062657461206265746120616c7068612067616d6d6120657073696c6f6e206574612064656c7461207a6574612074686574612067616d6d6120657073696c6f6e20626574612067616d6d61206574612062657461207a6574612064656c746120657073696c6f6e2067616d6d612067616d6d612074686574612064656c746120657461207a6574612067616d6d6120746865746120746865746120616c706861206574612067616d6d612065746120616c70686120746865746120657073696c6f6e2065746120657073696c6f6e20657461207468657461207a657461207a65746120626574612064656c74612064656c7461206574612065746120616c706861207a6574612074686574612074686574612067616d6d61206265746120616c706861206574612064656c7461206574612064656c74612062657461206574612064656c746120657073696c6f6e2064656c74612074686574612067616d6d6120616c7068612065746120746865746120657073696c6f6e2067616d6d612074686574612064656c74612062657461207a65746120616c7068612074686574612062657461207468657461207a65746120746865746120657073696c6f6e20746865746120616c7068612062657461207a6574612067616d6d612065746120657073696c6f6e2067616d6d6120616c7068612067616d6d612074686574612065746120746865746120657073696c6f6e2067616d6d6120616c70686120657073696c6f6e20746865746120616c706861207a65746120616c706861206574612074686574612064656c746120657073696c6f6e2074686574612067616d6d6120746865746120657073696c6f6e206265746120657073696c6f6e207a65746120657073696c6f6e207a65746120657073696c6f6e2065746120626574612064656c7461206574612067616d6d61206265746120657073696c6f6e20616c7068612064656c74612074686574612064656c746120657073696c6f6e20616c7068612062657461206265746120657461207a6574612064656c7461207a657461207a6574612062657461207a657461207468657461207a6574612067616d6d6120746865746120746865746120657073696c6f6e2074686574612067616d6d612074686574612064656c746120657073696c6f6e207a6574612067616d6d6120626574612064656c74612074686574612064656c7461207a6574612067616d6d61207a6574612067616d6d612067616d6d612064656c746120657073696c6f6e2065746120657461207a65746120657073696c6f6e207a6574612065746120657073696c6f6e2062657461207a65746120657073696c6f6e206574612074686574612067616d6d6120657073696c6f6e207a65746120746865746120746865746120626574612067616d6d61207a657461206574612067616d6d6120616c7068612062657461207a6574612067616d6d61207a65746120626574612065746120616c706861207a6574612064656c74612065746120657073696c6f6e2074686574612067616d6d61207a657461207a6574612064656c746120746865746120626574612067616d6d612064656c7461207a65746120657073696c6f6e2067616d6d6120657461207a65746120657073696c6f6e2062657461207a6574612064656c74612064656c74612064656c746120616c706861207a657461207a65746120616c7068612067616d6d612067616d6d6120626574612065746120746865746120657073696c6f6e2067616d6d61207a6574612062657461207a657461206574612064656c746120616c70686120657461207468657461207468657461207a6574612062657461207468657461206574612074686574612067616d6d61206574612065746120746865746120616c70686120626574612074686574612067616d6d6120626574612067616d6d6120626574612065746120657073696c6f6e20746865746120616c70686120657073696c6f6e2062657461207a6574612064656c74612067616d6d6120616c7068612067616d6d61206574612062657461207a65746120746865746120616c7068612074686574612064656c746120626574612074686574612067616d6d6120616c7068612067616d6d6120616c70686120616c7068612064656c746120616c706861207a6574612064656c74612067616d6d61207a65746120746865746120616c7068612067616d6d6120626574612064656c746120626574612074686574612064656c746120616c7068612064656c746120657461207a657461206574612067616d6d6120626574612067616d6d612064656c74612067616d6d61206574612064656c746120657073696c6f6e207a657461206574612067616d6d61206574612067616d6d6120657461207a65746120657073696c6f6e2062657461206265746120746865746120657073696c6f6e20657073696c6f6e20746865746120657073696c6f6e2064656c7461206574612067616d6d61206265746120616c7068612064656c74612064656c74612064656c74612065746120616c7068612067616d6d6120616c70686120657073696c6f6e20746865746120616c7068612064656c74612067616d6d61207a65746120616c7068612064656c746120626574612067616d6d612067616d6d61206265746120746865746120657073696c6f6e2064656c74612067616d6d61207a65746120657073696c6f6e2062657461206574612065746120616c70686120746865746120657073696c6f6e206265746120657073696c6f6e20616c7068612064656c746120657461207a65746120657073696c6f6e206574612064656c7461206574612067616d6d612067616d6d61207468657461207468657461207a6574612065746120746865746120657073696c6f6e2064656c74612074686574612074686574612064656c7461207468657461207a65746120657073696c6f6e20626574612067616d6d61207a6574612074686574612064656c74612067616d6d6120657073696c6f6e2064656c746120657073696c6f6e206265746120616c70686120616c7068612064656c7461207a65746120616c706861207a65746120657073696c6f6e207a65746120746865746120626574612065746120746865746120616c70686120657073696c6f6e2067616d6d612064656c74612067616d6d612067616d6d6120657461206265746120746865746120657073696c6f6e20626574612074686574612074686574612064656c74612067616d6d6120657073696c6f6e2064656c74612064656c7461207a65746120657461206574612064656c74612064656c746120616c70686120657073696c6f6e2064656c74612067616d6d612065746120657461206265746120746865746120657461206574612074686574612065746120657073696c6f6e2064656c74612064656c74612064656c746120616c706861206265746120616c70686120616c7068612065746120657461206574612064656c746120657073696c6f6e2062657461207a657461207a65746120746865746120626574612074686574612064656c746120657073696c6f6e20616c70686120616c70686120746865746120616c7068612067616d6d612067616d6d612064656c7461207a6574612064656c746120616c7068612067616d6d6120657073696c6f6e206265746120626574612067616d6d61206574612067616d6d6120616c70686120657073696c6f6e20657073696c6f6e20746865746120616c706861207a657461207a6574612062657461207a6574612062657461207a657461207a65746120657073696c6f6e20746865746120657073696c6f6e2067616d6d6120616c70686120616c706861207a6574612065746120616c706861207a65746120616c70686120626574612065746120657461206574612064656c74612067616d6d612067616d6d6120616c70686120616c706861207a6574612067616d6d6120657073696c6f6e20616c70686120616c7068612064656c74612064656c7461206574612062657461207a657461206265746120626574612064656c74612064656c74612064656c7461206265746120616c70686120657461206265746120657073696c6f6e2064656c746120616c70686120657461206574612067616d6d612067616d6d61206574612067616d6d61207468657461207a65746120616c7068612067616d6d61207468657461206574612074686574612067616d6d612074686574612067616d6d61207a6574612067616d6d6120616c70686120657073696c6f6e2067616d6d612067616d6d612065746120657073696c6f6e2074686574612074686574612074686574612064656c7461206574612065746120657073696c6f6e2064656c7461207a65746120616c7068612065746120616c7068612065746120657073696c6f6e20616c70686120746865746120657073696c6f6e20657073696c6f6e2064656c7461207468657461207468657461207a6574612074686574612064656c74612067616d6d6120746865746120657073696c6f6e207a6574612065746120626574612064656c746120657461206265746120657461207468657461207468657461206265746120657461207468657461207a657461207a6574612067616d6d612067616d6d612064656c74612067616d6d61206574612074686574612074686574612067616d6d612065746120657073696c6f6e207a6574612065746120657073696c6f6e20657073696c6f6e207a65746120616c7068612065746120616c7068612064656c"
+
+fn vec_noise1000_packed() -> Str
+    "00e80317fc7942bdf22106f0847762f0f3cb4d764dc7072051159a0f89f2c6dacae344bb311245fd6f84df9ad7c5b3d076ac0e8f53a7356c88913f20f6f72db022d24d0a96dad43c1617c1a98e78129e0327371065d095864f15ada0b846c1c0ebc5348adc799adf849bad05d4a10ac0441eaaeeb4b48efa0b1f0abd80e998a35aba5ea0bd8799c1350d439e71897aa75fde3134a4aa72e05628ac6fe68a733d1161a15d8eae2bb042d7958aedb1d594d6d112d34f6602f4de7110e993ae7422923d7d171165dc1906f63d57997a0ad31b3aae4081f41fb471653e3d577a8c4103f9cc198a7f89d81af2a5001c40173f1923f7102cfaa150a124b3c5c79bb88761a8db3f4101c2285b15bfebc216dc1bbefea1d7d6eb097d6f8a24d972da420ea6bf863eed3fc037a33402f24978c7162f32c05b0cae3e0d3af691992d127a36331fa65c277b5c7fe8c981bccbb3d62ac078d352d4f74fcd4c5331fef7e25f4588654ba17697d3886f9d0b89f5c36658b87aa4f749d6f569ef0ef625cc17ef7578236f827b6184465f12825617a05dd82e2b3c2f879512b6e7ac030faba9dfc2f8276bfac840a33d8c27dd39e08031bfbce6978736ad3afcb41e965d4c5bbde83f3748a9d7995feaf69f5a23365cc8b733888ac41b4515f58a7eb5aacee523b4fe394d8a3339395e60d5c8414acb63575b6780bd960fe3d0c4a19efe99f70f61013777fb58eb65636c12e339914e45ef2d190db87727ff09ada5a8b044291128af692066df71f8a13715d1276652c8fef222d86afa9b0bedeacde05ce91383bbbde5b9cd72016b84bd49eb63516b0b57ce560e473856e2fb5e1e0bcee5a2d0101a7ace14cbfc0d707b30c7f26154aa3bb13f1a948cee99fa7f880facb0a22f1dde2d01350f2e095712f61b60a966f4aef5b311c39cc92c965ed33ac7abce59c5b75eb9d4e075e3f6b08956c6f9154e570bef2f31a3791c18e6eeaabd002463cc35ad9f38e6296b7b184e49053975936a70d6a360ef5a2815390c3366822b37eecc7237f8b1cee43895e3c2693b03ed9927aeb162f824bad8226d7fb31fab78dce02b806fa554696fedd6bc61d1f7d0f01195095e310e4d961ff114636a8dfbdd13b0ef64934934e399d2e327694ef991c0be52dc9fedf271b893920fedbfb7987c0507434c0a54190068eeb5b911fa5e7a068dddad1a30e69f867effd685ad160fdb13547e45d3ac448f08561708f81eebefd4bd57965d254734d0b4e3e88e82e7904fa14713d2f876ea8b0fa23bf9408f8934de26be11f9e5639fb15cc4cba1198a6d13a2a2c8901243d580d328fd7566283a3f029023dc89f7ec8994185978f956494c5befcb0448c81b5c5a9f61424b184d6dc336ddc75d0d8f35433a4a9740c4b4276203bd48f47d20b5f800"
+
+fn vec_noise1000_plain() -> Str
+    "7942bdf22106f0847762f0f3cb4d764dc7072051159a0f89f2c6dacae344bb311245fd6f84df9ad7c5b3d076ac0e8f53a7356c88913f20f6f72db022d24d0a96dad43c1617c1a98e78129e0327371065d095864f15ada0b846c1c0ebc5348adc799adf849bad05d4a10ac0441eaaeeb4b48efa0b1f0abd80e998a35aba5ea0bd8799c1350d439e71897aa75fde3134a4aa72e05628ac6fe68a733d1161a15d8eae2bb042d7958aedb1d594d6d112d34f6602f4de7110e993ae7422923d7d171165dc1906f63d57997a0ad31b3aae4081f41fb471653e3d577a8c4103f9cc198a7f89d81af2a5001c40173f1923f7102cfaa150a124b3c5c79bb88761a8db3f4101c2285b15bfebc216dc1bbefea1d7d6eb097d6f8a24d972da420ea6bf863eed3fc037a33402f24978c7162f32c05b0cae3e0d3af691992d127a36331fa65c277b5c7fe8c981bccbb3d62ac078d352d4f74fcd4c5331fef7e25f4588654ba17697d3886f9d0b89f5c36658b87aa4f749d6f569ef0ef625cc17ef7578236f827b6184465f12825617a05dd82e2b3c2f879512b6e7ac030faba9dfc2f8276bfac840a33d8c27dd39e08031bfbce6978736ad3afcb41e965d4c5bbde83f3748a9d7995feaf69f5a23365cc8b733888ac41b4515f58a7eb5aacee523b4fe394d8a3339395e60d5c8414acb63575b6780bd960fe3d0c4a19efe99f70f61013777fb58eb65636c12e339914e45ef2d190db87727ff09ada5a8b044291128af692066df71f8a13715d1276652c8fef222d86afa9b0bedeacde05ce91383bbbde5b9cd72016b84bd49eb63516b0b57ce560e473856e2fb5e1e0bcee5a2d0101a7ace14cbfc0d707b30c7f26154aa3bb13f1a948cee99fa7f880facb0a22f1dde2d01350f2e095712f61b60a966f4aef5b311c39cc92c965ed33ac7abce59c5b75eb9d4e075e3f6b08956c6f9154e570bef2f31a3791c18e6eeaabd002463cc35ad9f38e6296b7b184e49053975936a70d6a360ef5a2815390c3366822b37eecc7237f8b1cee43895e3c2693b03ed9927aeb162f824bad8226d7fb31fab78dce02b806fa554696fedd6bc61d1f7d0f01195095e310e4d961ff114636a8dfbdd13b0ef64934934e399d2e327694ef991c0be52dc9fedf271b893920fedbfb7987c0507434c0a54190068eeb5b911fa5e7a068dddad1a30e69f867effd685ad160fdb13547e45d3ac448f08561708f81eebefd4bd57965d254734d0b4e3e88e82e7904fa14713d2f876ea8b0fa23bf9408f8934de26be11f9e5639fb15cc4cba1198a6d13a2a2c8901243d580d328fd7566283a3f029023dc89f7ec8994185978f956494c5befcb0448c81b5c5a9f61424b184d6dc336ddc75d0d8f35433a4a9740c4b4276203bd48f47d20b5f8"
+
+fn vec_seq0_packed() -> Str
+    "f248cdc9c957f040270100"
+
+fn vec_seq0_plain() -> Str
+    "48656c6c6f2048656c6c6f2048656c6c6f2048656c6c6f"
+
+fn vec_seq1_packed() -> Str
+    "4216484c4fcccc83b00100"
+
+fn vec_seq1_plain() -> Str
+    "48656c6c6f2048656c6c6f20616761696e2048656c6c6f"
+
+fn vec_seq2_packed() -> Str
+    "02130000"
+
+fn vec_seq2_plain() -> Str
+    "48656c6c6f"
+
+fn vec_final_packed() -> Str
+    "f348cdc9c90700"
+
+fn vec_final_plain() -> Str
+    "48656c6c6f"
+
+fn vec_cut_packed() -> Str
+    "4a4fcccd4d"
+
+// END VECTORS

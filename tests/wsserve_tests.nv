@@ -1,10 +1,6 @@
 // wsserve_tests.nv — the server's half of the upgrade, spelled in
 // http-codec-nv's own request type.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: websocket-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // THE REQUESTS BELOW ARE BUILT, NOT PARSED, and that is the point of
 // taking `H1Request` rather than bytes: `orbit/http-server` has already
 // parsed the request by the time it reaches the route that would
