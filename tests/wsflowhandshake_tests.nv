@@ -8,9 +8,7 @@
 
 use std.test
 use std.bytes
-use std.net
 use h1msg
-use h1read
 use wshandshake
 use wsclient
 use wsconn

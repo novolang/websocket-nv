@@ -8,16 +8,11 @@
 
 use std.test
 use std.bytes
-use std.net
-use h1msg
-use h1read
 use wshandshake
-use wsclient
 use wsconn
 use wsconnerr
 use wsclose
 use wsdeflate
-use wsserve
 use wstrans
 
 // ── The script: a transport that reads from memory ──────────────────
