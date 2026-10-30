@@ -1,0 +1,374 @@
+// wsflowheader_tests.nv — part of the connection tests, a connection from its handshake to its close, over a
+// transport that reads from memory, and over a loopback socket.
+//
+// The handshake checks use RFC 6455 section 1.3's own nonce and accept
+// value. The frames a connection sends are read back by a parser that
+// shares nothing with websocket-codec-nv, and the frames it is sent are
+// built by a builder that shares nothing with it either.
+
+use std.test
+use std.bytes
+use std.net
+use h1msg
+use h1read
+use wshandshake
+use wsclient
+use wsconn
+use wsconnerr
+use wsclose
+use wsdeflate
+use wsserve
+use wstrans
+
+// ── The script: a transport that reads from memory ──────────────────
+//
+// `g_in` is what the peer sends, one chunk for each time the connection
+// reads. When it runs out the transport answers a receive deadline, or the
+// close of the TCP connection if `g_eof` is set. `g_out` collects what the
+// connection sends. Nothing here touches a socket or a clock.
+
+var g_in: [[u8]] = []
+var g_at         = 0
+var g_out: [u8]  = []
+var g_eof        = false
+
+// When set, the first read answers with the 101 for the key the connection
+// sent, followed by `g_extra` header lines and then `g_tail` as frames.
+var g_reply      = false
+var g_replied    = false
+var g_extra      = ""
+var g_tail: [u8] = []
+
+// When above zero, a write takes at most this many bytes.
+var g_limit = 0
+
+struct Wire
+    tag: Int
+
+impl WsTransport[mutate] for Wire
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError> [mutate]
+        var n = bytes.len(data)
+        if g_limit > 0 and n > g_limit
+            n = g_limit
+        list.append(g_out, bytes.to_byte_list(bytes.slice(data, 0, n)))
+        Ok(n)
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError> [mutate]
+        if g_reply and not g_replied
+            g_replied = true
+            Ok(bytes.from_byte_list(joined([str_bytes(upgrade_answer()), g_tail])))
+        else if g_at < list.len(g_in)
+            let chunk = g_in[g_at]
+            g_at = g_at + 1
+            Ok(bytes.from_byte_list(chunk))
+        else if g_eof
+            Err(IoClosed)
+        else
+            Err(IoTimedOut)
+
+    fn ws_close(self) -> ?IoError [mutate]
+        None
+
+    fn ws_is_open(self) -> Bool
+        true
+
+fn load(chunks: [[u8]], eof: Bool)
+    g_in = chunks[:]
+    g_at = 0
+    g_out = []
+    g_eof = eof
+    g_reply = false
+    g_replied = false
+    g_extra = ""
+    g_tail = []
+    g_limit = 0
+
+// The key line the connection sent, without its name.
+fn key_sent() -> Str
+    let sent = text_of(g_out)
+    match str.index(sent, "Sec-WebSocket-Key: ")
+        None     => ""
+        Some(at) =>
+            let rest = str.slice(sent, at + 19, str.len(sent))
+            str.slice(rest, 0, str.index(rest, "\r\n") ?? 0)
+
+fn upgrade_answer() -> Str
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+        + wshandshake.accept_key(key_sent()) + "\r\n" + g_extra + "\r\n"
+
+fn wire() -> Wire
+    Wire { tag: 0 }
+
+fn hex(h: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_hex(h) ?? bytes.zeros(0))
+
+fn tohex(b: [u8]) -> Str
+    bytes.to_hex(bytes.from_byte_list(b))
+
+fn text_of(b: [u8]) -> Str
+    bytes.to_str(bytes.from_byte_list(b))
+
+fn repeated(h: Str, n: Int) -> [u8]
+    var out: [u8] = []
+    var i = 0
+    while i < n
+        list.append(out, hex(h))
+        i = i + 1
+    out
+
+fn joined(parts: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for p in parts
+        list.append(out, p)
+    out
+
+// ── Frames the peer sends ───────────────────────────────────────────
+
+fn key4() -> [u8]
+    [0x37, 0xfa, 0x21, 0x3d]
+
+// A frame with first byte `b0`, masked with `key` unless `key` is empty.
+fn fr(b0: Int, payload: [u8], key: [u8]) -> [u8]
+    var out: [u8] = [b0 as u8]
+    let n = list.len(payload)
+    var mask_bit = 0
+    if list.len(key) > 0
+        mask_bit = 0x80
+    if n < 126
+        list.push(out, (mask_bit | n) as u8)
+    else if n < 65536
+        list.push(out, (mask_bit | 126) as u8)
+        list.push(out, (n >> 8) as u8)
+        list.push(out, (n & 255) as u8)
+    else
+        list.push(out, (mask_bit | 127) as u8)
+        var shift = 56
+        while shift >= 0
+            list.push(out, ((n >> shift) & 255) as u8)
+            shift = shift - 8
+    if list.len(key) > 0
+        list.append(out, key)
+        list.append(out, list.map(list.range(0, n), i => (payload[i] as Int ^ key[i % 4] as Int) as u8))
+    else
+        list.append(out, payload)
+    out
+
+// A frame from a client, masked.
+fn c(b0: Int, payload: [u8]) -> [u8]
+    fr(b0, payload, key4())
+
+// A frame from a server, unmasked.
+fn s(b0: Int, payload: [u8]) -> [u8]
+    fr(b0, payload, [])
+
+fn str_bytes(t: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(t))
+
+fn close_body(code: Int, reason: Str) -> [u8]
+    var out: [u8] = [(code >> 8) as u8, (code & 255) as u8]
+    list.append(out, str_bytes(reason))
+    out
+
+// ── What a connection sent, read back by an independent parser ──────
+
+// One frame per entry, as `kind[M][R]:payload`, where `M` marks a masked
+// frame and `R` one with RSV1 set. The payload is unmasked.
+fn frames_sent(buf: [u8]) -> [Str]
+    var out: [Str] = []
+    var at = 0
+    while at + 2 <= list.len(buf)
+        let b0 = buf[at] as Int
+        let b1 = buf[at + 1] as Int
+        let masked = (b1 & 0x80) != 0
+        var n = b1 & 0x7F
+        var p = at + 2
+        if n == 126
+            n = (buf[p] as Int << 8) | buf[p + 1] as Int
+            p = p + 2
+        else if n == 127
+            n = 0
+            var i = 0
+            while i < 8
+                n = (n << 8) | buf[p + i] as Int
+                i = i + 1
+            p = p + 8
+        var key: [u8] = [0, 0, 0, 0]
+        if masked
+            key = buf[p:p + 4]
+            p = p + 4
+        var payload: [u8] = []
+        var i = 0
+        while i < n
+            var b = buf[p + i] as Int
+            if masked
+                b = b ^ key[i % 4] as Int
+            list.push(payload, b as u8)
+            i = i + 1
+        var kind = "op${b0 & 15}"
+        let op = b0 & 15
+        if op == 1
+            kind = "text"
+        else if op == 2
+            kind = "bin"
+        else if op == 0
+            kind = "cont"
+        else if op == 8
+            kind = "close"
+        else if op == 9
+            kind = "ping"
+        else if op == 10
+            kind = "pong"
+        if (b0 & 0x80) == 0
+            kind = kind + "-"
+        if masked
+            kind = kind + "M"
+        if (b0 & 0x40) != 0
+            kind = kind + "R"
+        var shown = tohex(payload)
+        if op == 1
+            shown = text_of(payload)
+        if op == 8
+            shown = "none"
+            if n >= 2
+                shown = "${(payload[0] as Int << 8) | payload[1] as Int}"
+        if n > 40 and op != 8
+            shown = "#${n}"
+        list.push(out, kind + ":" + shown)
+        at = p + n
+    out
+
+fn event_text(ev: WsConnEvent) -> Str
+    match ev
+        WsMessageReceived(msg) =>
+            match msg
+                TextMessage(b)   =>
+                    if list.len(b) > 40
+                        "T#${list.len(b)}"
+                    else
+                        "T:" + text_of(b)
+                BinaryMessage(b) =>
+                    if list.len(b) > 40
+                        "B#${list.len(b)}"
+                    else
+                        "B:" + tohex(b)
+        WsFragmentReceived(f)  => "F${f.header.fin}:${tohex(f.payload)}"
+        WsPingAnswered(p)      => "ping:" + tohex(p)
+        WsPongReceived(ms)     => "pong@${ms}"
+        WsCloseReceived(k)     => "close:${wsclose.number_of(k.code)}"
+        WsCloseCompleted       => "done"
+
+fn fault_text(f: ?WsConnError) -> Str
+    match f
+        None    => "-"
+        Some(e) =>
+            match wsconnerr.close_code_for(e)
+                Some(code) => "err:${wsclose.number_of(code)}"
+                None       => "err:none"
+
+// Everything one run of the script taught.
+struct Run
+    events: Str
+    sent: Str
+    fault: Str
+    conn: WsConn
+
+// Pump once for each chunk and once more, stopping at the first fault.
+fn drive_at(conn: WsConn, chunks: [[u8]], eof: Bool, now: Int) -> Run [mutate]
+    load(chunks, eof)
+    var cur = conn
+    var events: [Str] = []
+    var fault: ?WsConnError = None
+    var turns = 0
+    while turns <= list.len(chunks) and fault == None
+        match wsconn.pump(cur, wire(), now)
+            Err(e)   =>
+                fault = Some(e)
+            Ok(turn) =>
+                cur = turn.conn
+                for ev in turn.events
+                    list.push(events, event_text(ev))
+        turns = turns + 1
+    Run { events: str.join(events, "|"), sent: str.join(frames_sent(g_out), "|"),
+          fault: fault_text(fault), conn: cur }
+
+fn drive(conn: WsConn, chunks: [[u8]]) -> Run [mutate]
+    drive_at(conn, chunks, false, 0)
+
+fn server() -> WsConn
+    wsconn.connection(ServerSide, wsconn.quiet_options(), WsDeflateOff, None)
+
+fn client() -> WsConn
+    wsconn.connection(ClientSide, wsconn.quiet_options(), WsDeflateOff, None)
+
+// What a script is expected to teach, in one assertion.
+fn expect(r: Run, events: Str, sent: Str, fault: Str)
+    test.assert_eq(r.events, events)
+    test.assert_eq(r.sent, sent)
+    test.assert_eq(r.fault, fault)
+
+// A transport that reports itself closed, and refuses every write.
+struct Shut
+    tag: Int
+
+impl WsTransport[] for Shut
+    fn ws_send(self, data: Bytes) -> Result<Int, IoError>
+        Err(IoBrokenPipe)
+
+    fn ws_recv(self, max: Int) -> Result<Bytes, IoError>
+        Ok(bytes.zeros(0))
+
+    fn ws_close(self) -> ?IoError
+        None
+
+    fn ws_is_open(self) -> Bool
+        false
+
+fn rfc_nonce() -> [u8]
+    str_bytes("the sample nonce")
+
+fn address() -> WsAddress
+    WsAddress { secure: false, host: "example.com", port: 80, target: "/chat" }
+
+fn upgrade_text(extra: Str) -> Str
+    "GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" + extra + "\r\n"
+
+fn sent_text() -> Str
+    text_of(g_out)
+
+// ── Sending ─────────────────────────────────────────────────────────
+
+fn sent_by(c: WsConn, f: Int) -> Str [mutate]
+    // f picks the send: 0 text, 1 binary
+    load([], false)
+    var result = "ok"
+    if f == 0
+        match wsconn.send_text(c, wire(), str_bytes("Hello"), 0)
+            Ok(_)  =>
+                result = "ok"
+            Err(_) =>
+                result = "refused"
+    else
+        match wsconn.send_binary(c, wire(), [1, 2, 3], 0)
+            Ok(_)  =>
+                result = "ok"
+            Err(_) =>
+                result = "refused"
+    result + ":" + str.join(frames_sent(g_out), "|")
+
+fn connect_with(r: WsClientRequest, extra: Str,
+                tail: [u8]) -> Result<WsConn, WsConnError> [mutate, rand]
+    load([], false)
+    g_reply = true
+    g_extra = extra
+    g_tail = tail[:]
+    wsclient.connect(wire(), r, wsconn.default_options())
+
+@test
+fn test_a_client_refuses_a_header_it_cannot_write() [mutate, rand]
+    test.case("a header the caller supplied cannot be written")
+    let bad = wsclient.with_headers(wsclient.request(address()),
+                                    h1msg.headers([H1Header { name: "Bad Name", value: "x" }]))
+    match connect_with(bad, "", [])
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(str.contains(e.message(), "could not be written"))
