@@ -392,8 +392,12 @@ impl WsTransport[net] for WsTls
         match tls.recv(self.conn, max)
             Some(chunk) => Ok(chunk)
             None        =>
-                // workaround(tls-recv-cannot-tell-a-receive-deadline-from-an-abrupt-close): only a close_notify names itself, so any other empty read is taken for a deadline.
-                if tls.last_error() == "tls: peer closed cleanly"
+                // `tls.last_error()` names an end of stream, clean or not,
+                // and a receive deadline.  A compiler that predates the
+                // two newer messages names only the clean close, so any
+                // other empty read is taken for a deadline there.
+                let why = tls.last_error()
+                if why == "tls: peer closed cleanly" or why == "tls: peer closed without close_notify"
                     Err(IoClosed)
                 else
                     Err(IoTimedOut)

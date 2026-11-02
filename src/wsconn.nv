@@ -47,7 +47,6 @@ use wsclose
 use wsframe
 use wsread
 use wswrite
-use wserr
 use wstrans
 use wsconnerr
 use wsdeflate

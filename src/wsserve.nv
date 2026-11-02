@@ -24,7 +24,6 @@
 // `Sec-WebSocket-Version` field (RFC 6455 section 4.4).
 
 use h1msg
-use h1read
 use h1write
 use wserr
 use wshandshake

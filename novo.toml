@@ -44,4 +44,4 @@ http-codec-nv = "^0.1.0"
 # permessage-deflate (RFC 7692). The negotiation and the four trailing bytes
 # are this package's, and the DEFLATE is flate-nv's, in raw mode with no zlib
 # header.
-flate-nv = "^0.1.0"
+flate-nv = "^0.1.1"

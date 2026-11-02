@@ -18,7 +18,6 @@
 
 use std.bytes
 use h1msg
-use h1read
 use h1write
 use wshandshake
 use wsconn
