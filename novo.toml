@@ -1,6 +1,6 @@
 [package]
 name        = "websocket-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The socket half of WebSocket, over websocket-codec-nv: the RFC 6455 upgrade handshake on both sides over http-codec-nv, a connection value with typed send and receive, reassembly limits, automatic ping answering, the close handshake with its two deadlines, permessage-deflate over flate-nv, and the accept-loop shape a server takes."
 license     = "Apache-2.0"
 
@@ -24,7 +24,7 @@ category    = "networking"
 tags        = ["websocket", "rfc6455", "client", "server", "upgrade", "permessage-deflate", "tls"]
 repository  = "https://github.com/novolang/websocket-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.22.0"
+novo        = ">= 0.23.0"
 
 # A library: it has no `main`, so `novo pkg build` checks every module under
 # `src/` and writes no binary.
